@@ -413,6 +413,7 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
         const addressData = {
             attention: '',
             addresslabel: '',
+            billLocCode: '',
             addressee: '',
             address1: '',
             address2: '',
@@ -473,6 +474,11 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
                         join: 'Address',
                         label: 'Address Label'
                     }),
+                    search.createColumn({
+                        name: 'custrecord_ft_add_bill_loccode',
+                        join: 'Address',
+                        label: 'Billing Location Code'
+                    }),                  
                     search.createColumn({
                         name: 'addressphone',
                         join: 'Address',
@@ -551,6 +557,7 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
 
                 addressData.attention = billingRow.getValue({ name: 'attention', join: 'Address' }) || '';
                 addressData.addresslabel = billingRow.getValue({ name: 'addresslabel', join: 'Address' }) || '';
+                addressData.billLocCode = billingRow.getValue({ name: 'custrecord_ft_add_bill_loccode', join: 'Address' }) || '';
                 addressData.addressee = billingRow.getValue({ name: 'addressee', join: 'Address' }) || '';
                 addressData.address1 = billingRow.getValue({ name: 'address1', join: 'Address' }) || '';
                 addressData.address2 = billingRow.getValue({ name: 'address2', join: 'Address' }) || '';
@@ -748,6 +755,26 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
 
         // Set main body fields
         soRec.setValue({ fieldId: 'entity', value: entityId });
+
+try {
+    const customerFields = search.lookupFields({
+        type: search.Type.CUSTOMER,
+        id: entityId,
+        columns: ['custentity_ft_topparent']
+    });
+
+    const topParent = customerFields.custentity_ft_topparent;
+
+    if (topParent && topParent.length) {
+        soRec.setValue({
+            fieldId: 'custbody_ft_topparent',
+            value: topParent[0].value
+        });
+    }
+} catch (e) {
+    log.error('Error Setting FT Top Parent', e);
+}
+      
         soRec.setValue({ fieldId: 'location', value: orderLocationId });
         soRec.setValue({ fieldId: 'externalid', value: plan.externalId });
         soRec.setValue({ fieldId: 'custbody_po_number_vb', value: poNumbers.join(', ') });
@@ -769,7 +796,7 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
         });
         if (billingAddress) {
             if (billingAddress.attention) soRec.setValue({ fieldId: 'custbody_ft_billattention', value: billingAddress.attention });
-            if (billingAddress.addresslabel) soRec.setValue({ fieldId: 'custbody_ft_billloccode', value: billingAddress.addresslabel });
+            if (billingAddress.addresslabel) soRec.setValue({ fieldId: 'custbody_ft_billloccode', value: billingAddress.billLocCode });
             if (billingAddress.addressee) soRec.setValue({ fieldId: 'custbody_ft_billaddressee', value: billingAddress.addressee });
             if (billingAddress.address1) soRec.setValue({ fieldId: 'custbody_ft_billaddress1', value: billingAddress.address1 });
             if (billingAddress.address2) soRec.setValue({ fieldId: 'custbody_ft_billaddress2', value: billingAddress.address2 });
