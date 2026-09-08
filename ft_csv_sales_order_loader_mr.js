@@ -8,6 +8,11 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
     // Configuration / Script Parameter defaults
     const CONFIG = {
         FILE_ID_PARAM: 'custscript_sample_loader_order_file_id', // Direct File ID parameter
+
+        PENDING_FOLDER_ID: 2711879,                          // Pending Files
+        PROCESSED_FOLDER_ID: 2711880,                        // Processed Files
+        ERROR_FOLDER_ID: 2711881,                            // Error Files
+
         CUSTOMER_ID: 972653,                                 // Hardcoded Customer ID
         LOCATION_ID: 32,                                     // Hardcoded Location ID (CA2)
         MG_SOURCE_SYSTEM_ID: 2,                               // custentity_ft_sourcesystem value ID for MG
@@ -15,6 +20,49 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
         CUST_REF_QUALIFIER_SID: 1,                            // custrecord_ft_cr_qualifier internal id for "SID"
         CUST_REF_QUALIFIER_PO: 2                              // custrecord_ft_cr_qualifier internal id for "PO Number"
     };
+
+    // Helper: Return every file sitting inside a given cabinet folder
+    function getFilesFromFolder(folderId) {
+        const out = [];
+        try {
+            const fileSearch = search.create({
+                type: 'file',
+                filters: [['folder', 'anyof', String(folderId)]],
+                columns: ['name', 'internalid']
+            });
+
+            fileSearch.run().each(function (res) {
+                out.push({
+                    id: res.id,
+                    name: res.getValue({ name: 'name' })
+                });
+                return true;
+            });
+        } catch (e) {
+            log.error('Error searching folder files', {
+                folderId: folderId,
+                error: e
+            });
+        }
+        return out;
+    }
+
+    // Helper: Move a file into another cabinet folder
+    function moveFile(fileId, folderId) {
+        try {
+            const f = file.load({ id: fileId });
+            f.folder = folderId;
+            f.save();
+
+            log.audit('File Moved', `File ${fileId} moved to folder ${folderId}`);
+        } catch (e) {
+            log.error('Error moving file', {
+                fileId: fileId,
+                folderId: folderId,
+                error: e
+            });
+        }
+    }
 
     // Helper: Parse CSV Line handling quotes and commas
     function parseCsvLine(line) {
@@ -526,7 +574,7 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
     function addOrderItems(soRec, orderLocationId, includeMG, includeSynapse) {
         if (includeMG) {
             soRec.selectNewLine({ sublistId: 'item' });
-            soRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item', value: 8797 });
+            soRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'item', value: 8899 });
             soRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'quantity', value: 1 });
             soRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'rate', value: 0.01 });
             soRec.setCurrentSublistValue({ sublistId: 'item', fieldId: 'amount', value: 0.01 });
@@ -898,7 +946,7 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
             }
         }
 
-        // Add Sublist Items according to this plan (MG -> item 8797, Synapse -> item 2990)
+        // Add Sublist Items according to this plan (MG -> item 8797 (SB) 8899 (Prod), Synapse -> item 2990)
         addOrderItems(soRec, orderLocationId, plan.includeMG, plan.includeSynapse);
 
         // Re-apply header location right before saving to prevent Dynamic Mode sourcing from clearing it.
@@ -999,24 +1047,36 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
     // ================== ENTRY POINTS ==================
 
     /**
-    * Retrieves the file ID directly from script parameter
+    * Gets all files from the Pending folder, plus the optional parameter file
     */
     function getInputData() {
         try {
             const script = runtime.getCurrentScript();
-            const fileId = script.getParameter({ name: CONFIG.FILE_ID_PARAM });
 
-            if (!fileId) {
-                log.error('Missing Parameter', `Script parameter ${CONFIG.FILE_ID_PARAM} is not configured.`);
-                return [];
+            const paramFileId = script.getParameter({
+                name: CONFIG.FILE_ID_PARAM
+            });
+
+            // Get all files from Pending folder
+            const files = getFilesFromFolder(CONFIG.PENDING_FOLDER_ID);
+
+            // Also process parameter file if provided
+            if (paramFileId) {
+                const already = files.some(function (f) {
+                    return String(f.id) === String(paramFileId);
+                });
+
+                if (!already) {
+                    files.push({
+                        id: paramFileId,
+                        name: 'Param_File_' + paramFileId + '.csv'
+                    });
+                }
             }
 
-            log.audit('getInputData', `Processing single file ID: ${fileId}`);
+            log.audit('getInputData', `Files to process: ${files.length}`);
 
-            return [{
-                id: fileId,
-                name: 'Direct_File_Import_' + fileId + '.csv'
-            }];
+            return files;
         } catch (e) {
             log.error('Error in getInputData', e.message || e.toString());
             return [];
@@ -1100,8 +1160,16 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
 
             log.audit('File processing complete', `Processed ${lineIndex} lines in ${fileName}. Emitted ${emittedCount} rows.`);
 
+            // SUCCESS -> Processed Files
+            moveFile(fileId, CONFIG.PROCESSED_FOLDER_ID);
+
         } catch (e) {
             log.error(`Error in map stage for file ID ${fileId}`, e.message || e.toString());
+
+            // ERROR -> Error Files
+            if (fileId) {
+                moveFile(fileId, CONFIG.ERROR_FOLDER_ID);
+            }
         }
     }
 
@@ -1453,6 +1521,7 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
             log.error(`Failed to process SID ${sid}`, err || err.toString());
         }
     }
+
     // Helper: Search NetSuite Location by header/list text and return internal ID
     function findLocationByText(locationText) {
         if (!locationText) return null;
