@@ -9,7 +9,7 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
     const CONFIG = {
         FILE_ID_PARAM: 'custscript_sample_loader_order_file_id', // Direct File ID parameter
 
-        PENDING_FOLDER_ID: 2711879,                          // Pending Files
+        PENDING_FOLDER_ID: 2725429,                          // Pending Files
         PROCESSED_FOLDER_ID: 2711880,                        // Processed Files
         ERROR_FOLDER_ID: 2711881,                            // Error Files
 
@@ -18,7 +18,8 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
         MG_SOURCE_SYSTEM_ID: 2,                               // custentity_ft_sourcesystem value ID for MG
         CUST_REF_RECORD_TYPE: 'customrecord_ft_cust_references',
         CUST_REF_QUALIFIER_SID: 1,                            // custrecord_ft_cr_qualifier internal id for "SID"
-        CUST_REF_QUALIFIER_PO: 2                              // custrecord_ft_cr_qualifier internal id for "PO Number"
+        CUST_REF_QUALIFIER_PO: 2,                             // custrecord_ft_cr_qualifier internal id for "PO Number"
+        CUST_REF_QUALIFIER_CT: 4
     };
 
     // Helper: Return every file sitting inside a given cabinet folder
@@ -152,19 +153,42 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
     function getCustomerOrderFlags(customerId) {
         const flags = { mg: false, synapse: false };
         if (!customerId) return flags;
-        try {
-            const fields = search.lookupFields({
-                type: 'customer',
-                id: customerId,
-                columns: ['custentity_ft_cus_mg_order', 'custentity_ft_cus_synapse_order']
-            });
-            if (fields) {
-                flags.mg = (fields.custentity_ft_cus_mg_order === true || fields.custentity_ft_cus_mg_order === 'T');
-                flags.synapse = (fields.custentity_ft_cus_synapse_order === true || fields.custentity_ft_cus_synapse_order === 'T');
-            }
-        } catch (e) {
-            log.error('Error looking up customer order flags', { customerId: customerId, error: e });
-        }
+        const customerSearchObj = search.create({
+   type: "customer",
+   filters:
+   [
+      ["internalid","anyof",customerId]
+   ],
+   columns:
+   [
+      // search.createColumn({name: "parent", label: "Top Level Parent"}),
+      // search.createColumn({
+      //    name: "custentity_ft_cus_mg_order",
+      //    join: "topLevelParent",
+      //    label: "MG Order"
+      // }),
+      // search.createColumn({
+      //    name: "custentity_ft_cus_synapse_order",
+      //    join: "topLevelParent",
+      //    label: "Synapse Order"
+      // }),
+      search.createColumn({name: "custentity_ft_cus_mg_order", label: "MG Order"}),
+      search.createColumn({name: "custentity_ft_cus_synapse_order", label: "Synapse Order"})
+   ]
+});
+const searchResultCount = customerSearchObj.runPaged().count;
+log.debug("customerSearchObj result count",searchResultCount);
+customerSearchObj.run().each(function(result){
+   // var Parent_id = result.getValue('parent');
+   // if (Parent_id) {
+   //   flags.mg = result.getValue({name: "custentity_ft_cus_mg_order", join: 'topLevelParent'});
+   //   flags.synapse = result.getValue({name: "custentity_ft_cus_synapse_order", join: 'topLevelParent'});
+   // }else {
+     flags.mg = result.getValue({name: "custentity_ft_cus_mg_order"});
+     flags.synapse = result.getValue({name: "custentity_ft_cus_synapse_order"});
+  // }
+   return true;
+});
         return flags;
     }
 
@@ -725,11 +749,12 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
         // Determine Location based on Outbound vs Inbound
         const typeVal = (firstRow['TYPE'] || '').trim().toUpperCase();
         let locationKey = '';
-        if (typeVal === 'O') {
-            locationKey = firstRow['SHIP FROM SHORT KEY'];
-        } else if (typeVal === 'R' || typeVal === 'I') {
-            locationKey = firstRow['SHIP TO SHORT KEY'];
-        }
+        // if (typeVal === 'O') {
+        //     locationKey = firstRow['SHIP FROM SHORT KEY'];
+        // } else if (typeVal === 'R' || typeVal === 'I') {
+        //     locationKey = firstRow['SHIP TO SHORT KEY'];
+        // }
+        locationKey = firstRow['Intermediate Warehouse'];
 
         log.debug('Location Resolution Inputs', {
             sid: sid,
@@ -984,6 +1009,41 @@ try {
         // addOrderItems() runs.
         soRec.setValue({ fieldId: 'location', value: orderLocationId });
 
+        // Set Customer Method for orders that include Synapse.
+if (plan.includeSynapse) {
+    const scacCode = String(firstRow['SCAC CODE'] || '')
+        .trim()
+        .toUpperCase();
+
+    let customerMethodId = null;
+
+    if (inboundOutbound === 1) {
+        // Inbound (I/R): always TL.
+        customerMethodId = 1;
+    } else if (inboundOutbound === 2) {
+        // Outbound (O): determine method from SCAC.
+        if (scacCode === 'GLBL') {
+            customerMethodId = 2; // LTL
+        } else if (['UPSG', 'UP3D', 'FDEG'].indexOf(scacCode) !== -1) {
+            customerMethodId = 25; // Parcel
+        }
+    }
+
+    if (customerMethodId !== null) {
+        soRec.setValue({
+            fieldId: 'custbody_ft_customermethod',
+            value: customerMethodId
+        });
+
+        log.audit('Synapse Customer Method Set', {
+            externalId: plan.externalId,
+            inboundOutbound: inboundOutbound,
+            scacCode: scacCode,
+            customerMethodId: customerMethodId
+        });
+    }
+}
+
         // Verify what is actually set on the record right before save (not just the
         // intended variable), so any future field-mapping collisions are visible in logs.
         const entityOnRecordBeforeSave = soRec.getValue({ fieldId: 'entity' });
@@ -1062,7 +1122,15 @@ try {
                 poNumbers.forEach(function (po) {
                     createCustomerReferenceRecord(soId, CONFIG.CUST_REF_QUALIFIER_PO, po);
                 });
+
+
+                const contractType = String(firstRow['Contract Type'] || '').trim();
+
+                if (contractType) {
+                   createCustomerReferenceRecord(soId, CONFIG.CUST_REF_QUALIFIER_CT, contractType);
+                }
             }
+
 
             return soId;
         } catch (saveErr) {
