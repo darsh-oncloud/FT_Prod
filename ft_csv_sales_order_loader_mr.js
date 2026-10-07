@@ -1589,7 +1589,7 @@ if (plan.includeSynapse) {
                                                     finalValue = null;
                                                 }
                                             } else if (lowFieldId.indexOf('qty') !== -1 || lowFieldId.indexOf('weight') !== -1 || lowFieldId.indexOf('cube') !== -1 || lowFieldId.indexOf('pallet') !== -1 || lowFieldId.indexOf('count') !== -1 || lowFieldId.indexOf('seq') !== -1 || lowFieldId.indexOf('amount') !== -1) {
-                                                const parsedNum = Number(csvValue);
+                                                const parsedNum = Number(String(csvValue).replace(/,/g, ''));
                                                 if (!isNaN(parsedNum)) {
                                                     finalValue = parsedNum;
                                                 }
