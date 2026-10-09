@@ -8,7 +8,6 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
     const STOP_SEARCH = 'customsearch_ft_finding_old_stops';
     const TARGET = 'custbody_ft_related_stop_details';
 
-    // TEST MODE: Process only first PO, no updates.
     const TEST_MODE = true;
 
     const FIELDS = [
@@ -38,36 +37,84 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
         'custrecord_ft_shipstop_apptime',
         'custrecord_ft_stop_plantime',
         'custrecord_ft_stop_actualtime',
-        'custrecord_ft_shipstop_apptnum',
-        'custrecord_ft_shipstop_latereason'
+        'custrecord_ft_shipstop_latereason',
+        'custrecord_ft_shipstop_apptnum'
     ];
+
+    const NUMBER_FIELDS = [
+        'custrecord_ft_shipstop_pallcount',
+        'custrecord_ft_stop_weight',
+        'custrecord_ft_stop_linearfeet',
+        'custrecord_ft_stop_casescount'
+    ];
+
+    const DATE_FIELDS = [
+        'custrecord_ft_ship_plandate',
+        'custrecord_ft_ship_actualdate',
+        'custrecord_ft_ship_appt'
+    ];
+
+    const TIME_FIELDS = [
+        'custrecord_ft_shipstop_apptime',
+        'custrecord_ft_stop_plantime',
+        'custrecord_ft_stop_actualtime'
+    ];
+
+    // Format NetSuite time as 24-hour H:mm.
+    const formatTime = value => {
+        const text = String(value || '').trim();
+        if (!text) return '';
+
+        const m = text.match(/^(\d{1,2}):(\d{2})(?::\d{2})?\s*(am|pm)?$/i);
+        if (!m) return text;
+
+        let hour = Number(m[1]);
+        const minute = m[2];
+        const period = (m[3] || '').toLowerCase();
+
+        if (period === 'pm' && hour < 12) hour += 12;
+        if (period === 'am' && hour === 12) hour = 0;
+
+        return hour + ':' + minute;
+    };
+
+    const formatDate = value => {
+        const text = String(value || '').trim();
+        const m = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+
+        if (!m) return text;
+
+        return m[1].padStart(2, '0') + '/' +
+            m[2].padStart(2, '0') + '/' + m[3];
+    };
 
     const getInputData = () => {
         const s = search.load({ id: PO_SEARCH });
 
-        // Add grouped PO Internal ID.
-        s.columns = [
-            ...s.columns.filter(c =>
-                !(c.name === 'internalid' && !c.join &&
-                  c.summary === search.Summary.GROUP)
-            ),
-            search.createColumn({
-                name: 'internalid',
-                summary: search.Summary.GROUP
-            })
-        ];
+        // Add PO ID to existing summary search.
+        if (!s.columns.some(c =>
+            c.name === 'internalid' &&
+            !c.join &&
+            c.summary === search.Summary.GROUP
+        )) {
+            s.columns = [
+                ...s.columns,
+                search.createColumn({
+                    name: 'internalid',
+                    summary: search.Summary.GROUP
+                })
+            ];
+        }
 
+        if (!TEST_MODE) return s;
+
+        // Test exactly one PO.
         const results = s.run().getRange({
             start: 0,
-            end: TEST_MODE ? 1 : 1000
+            end: 1
         });
 
-        log.audit('PO Search Results', {
-            mode: TEST_MODE ? 'DRY RUN - ONE PO' : 'LIVE',
-            selectedCount: results.length
-        });
-
-        return results.map(r => ({
+        const input = results.map(r => ({
             poId: r.getValue({
                 name: 'internalid',
                 summary: search.Summary.GROUP
@@ -77,22 +124,39 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                 summary: search.Summary.GROUP
             })
         }));
+
+        log.audit('TEST INPUT - ONE PO', input);
+
+        return input;
     };
 
     const map = context => {
-        const { poId, docNum } = JSON.parse(context.value);
+        let poId, docNum;
 
         try {
-            log.audit('1 - Processing PO', { poId, docNum });
+            const input = JSON.parse(context.value);
+
+            if (TEST_MODE) {
+                poId = input.poId;
+                docNum = input.docNum;
+            } else {
+                // Saved search result from live getInputData.
+                const values = input.values || {};
+                poId = values['GROUP(internalid)'];
+                docNum = values['GROUP(tranid)'];
+
+                if (poId && typeof poId === 'object') poId = poId.value;
+                if (docNum && typeof docNum === 'object') docNum = docNum.value;
+            }
 
             if (!poId || !docNum) {
-                log.error('SKIPPED - Missing PO Details', {
-                    poId, docNum
-                });
+                log.error('SKIPPED - Missing PO ID/Number', input);
                 return;
             }
 
-            // SEARCH 2: Historical Shipment Stops.
+            log.audit('1 - Processing PO', { poId, docNum });
+
+            // SEARCH 2: Use PO number in saved search.
             const oldSearch = search.load({ id: STOP_SEARCH });
 
             oldSearch.filterExpression = [
@@ -111,25 +175,24 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                 summary: search.Summary.MAX
             }));
 
-            log.audit('2 - Historical Stops Found', {
+            log.audit('2 - Historical Stops', {
                 docNum,
                 count: oldResults.length,
                 stopIds
             });
 
             if (oldResults.length !== 2 ||
-                new Set(stopIds.map(String)).size !== 2 ||
-                stopIds.some(id => !id)) {
+                stopIds.some(id => !id) ||
+                new Set(stopIds.map(String)).size !== 2) {
 
-                log.audit('SKIPPED - Expected 2 Unique Stops', {
-                    docNum,
-                    count: oldResults.length,
-                    stopIds
+                log.audit('SKIPPED - Invalid Stop Count', {
+                    docNum, stopIds,
+                    count: oldResults.length
                 });
                 return;
             }
 
-            // SEARCH 3: Get actual Shipment Stop values.
+            // SEARCH 3: Retrieve actual Shipment Stop data.
             const columns = FIELDS.map(id =>
                 search.createColumn({ name: id })
             );
@@ -146,36 +209,30 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
             });
 
             if (stopResults.length !== 2) {
-                log.audit('SKIPPED - Stop Records Not Found', {
+                log.audit('SKIPPED - Missing Stop Records', {
                     docNum, stopIds
                 });
                 return;
             }
 
-            const payload = stopResults.map(r => {
-                const obj = {};
+            const stops = stopResults.map(r => {
+                const data = {
+                    internalid: r.id
+                };
 
-                FIELDS.forEach((id, i) => {
-                    const value = r.getValue(columns[i]);
-
-                    if (value !== null &&
-                        value !== undefined &&
-                        value !== '') {
-                        obj[id] = value;
-                    } else if (id === 'custrecord_ft_ship_add2') {
-                        obj[id] = '';
-                    }
+                FIELDS.forEach((field, i) => {
+                    data[field] = r.getValue(columns[i]);
                 });
 
-                return obj;
+                return data;
             });
 
-            const types = payload.map(p =>
-                String(p.custrecord_ft_ship_type || '')
+            const types = stops.map(s =>
+                String(s.custrecord_ft_ship_type || '')
             );
 
-            const refs = payload.map(p =>
-                p.custrecord_ft_ship_refid || ''
+            const refs = stops.map(s =>
+                String(s.custrecord_ft_ship_refid || '').trim()
             );
 
             log.audit('3 - Stop Validation', {
@@ -185,30 +242,20 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                 refs
             });
 
-            // Exactly one Pickup (2), one Drop Off (1).
             if (!types.includes('1') ||
                 !types.includes('2') ||
-                refs.some(ref => !String(ref).trim())) {
+                refs.some(ref => !ref)) {
 
                 log.audit('SKIPPED - Invalid Stops', {
                     docNum,
                     stopIds,
                     types,
-                    refs,
-                    reason: 'Invalid Pickup/Drop Off or missing Stop Reference ID'
+                    refs
                 });
                 return;
             }
 
-            // Pickup first, Drop Off second.
-            payload.sort((a, b) =>
-                Number(b.custrecord_ft_ship_type) -
-                Number(a.custrecord_ft_ship_type)
-            );
-
-            const newValue = JSON.stringify(payload);
-
-            // Read existing PO field for comparison.
+            // Read current PO JSON.
             const po = record.load({
                 type: record.Type.PURCHASE_ORDER,
                 id: poId,
@@ -217,34 +264,155 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
 
             const oldValue = po.getValue({
                 fieldId: TARGET
+            }) || '';
+
+            log.audit('4 - Existing PO JSON', {
+                poId, docNum, oldValue
             });
 
-            log.audit('4 - Existing PO Payload', {
-                poId,
-                docNum,
-                oldValue
+            let existing = [];
+
+            if (oldValue) {
+                try {
+                    existing = JSON.parse(oldValue);
+                    if (!Array.isArray(existing)) {
+                        throw new Error('Existing payload is not an array');
+                    }
+                } catch (e) {
+                    log.error('SKIPPED - Invalid Existing JSON', {
+                        docNum,
+                        message: e.message
+                    });
+                    return;
+                }
+            }
+
+            // Build JSON using actual stop records.
+            const warnings = [];
+
+            const payload = stops.map(stop => {
+                const type = String(stop.custrecord_ft_ship_type);
+
+                // Match existing data by Pickup/Drop Off.
+                const previous = existing.find(p =>
+                    String(p.custrecord_ft_ship_type) === type
+                ) || {};
+
+                const obj = {};
+
+                FIELDS.forEach(field => {
+                    let value = stop[field];
+
+                    if (value === null ||
+                        value === undefined ||
+                        value === '') {
+
+                        // Preserve old value when actual field is empty.
+                        value = previous[field];
+                    }
+
+                    if (value === null ||
+                        value === undefined ||
+                        value === '') {
+
+                        if (field === 'custrecord_ft_ship_add2') {
+                            obj[field] = '';
+                        }
+                        return;
+                    }
+
+                    if (NUMBER_FIELDS.includes(field)) {
+                        const num = Number(value);
+                        if (Number.isFinite(num)) {
+                            obj[field] = num;
+                        } else {
+                            warnings.push(type + ': invalid number ' + field);
+                        }
+                    } else if (TIME_FIELDS.includes(field)) {
+                        obj[field] = formatTime(value);
+                    } else if (DATE_FIELDS.includes(field)) {
+                        const recordDate = formatDate(value);
+                        const oldDateTime = String(previous[field] || '');
+                        const oldDate = formatDate(oldDateTime);
+
+                        // Preserve existing hour/minute if date agrees.
+                        if (recordDate &&
+                            oldDate === recordDate &&
+                            /^\d{1,2}\/\d{1,2}\/\d{4}\s+\d{1,2}:\d{2}$/.test(oldDateTime)) {
+
+                            obj[field] = recordDate + ' ' +
+                                oldDateTime.trim().split(/\s+/)[1];
+
+                        } else {
+                            obj[field] = recordDate;
+                            warnings.push(
+                                type + ': Full timestamp unavailable for ' +
+                                field
+                            );
+                        }
+                    } else {
+                        obj[field] = String(value);
+                    }
+                });
+
+                // Always use actual reference ID from Shipment Stop.
+                obj.custrecord_ft_ship_refid =
+                    String(stop.custrecord_ft_ship_refid).trim();
+
+                // Derive Stop ID from trailing reference ID segment.
+                const match = obj.custrecord_ft_ship_refid.match(/_(\d+)$/);
+
+                if (match) {
+                    obj.custrecord_ft_stopID = match[1];
+                } else {
+                    warnings.push(type + ': Cannot derive Stop ID');
+                }
+
+                return obj;
             });
 
-            log.audit('5 - NEW Corrected JSON Payload', {
+            // Pickup first, then Drop Off.
+            payload.sort((a, b) =>
+                Number(b.custrecord_ft_ship_type) -
+                Number(a.custrecord_ft_ship_type)
+            );
+
+            const newValue = JSON.stringify(payload);
+
+            log.audit('5 - CORRECTED JSON PAYLOAD', {
                 poId,
                 docNum,
                 stopIds,
                 newValue
             });
 
+            log.audit('6 - Payload Review', {
+                docNum,
+                pickupRef: payload[0].custrecord_ft_ship_refid,
+                dropoffRef: payload[1].custrecord_ft_ship_refid,
+                pickupStopID: payload[0].custrecord_ft_stopID,
+                dropoffStopID: payload[1].custrecord_ft_stopID,
+                payloadLength: newValue.length,
+                warnings
+            });
+
             if (TEST_MODE) {
-                log.audit('6 - TEST SUCCESS - NO UPDATE', {
+                log.audit('7 - TEST SUCCESS - NO PO UPDATE', {
                     poId,
                     docNum,
-                    pickupId: stopIds[types.indexOf('2')],
-                    dropoffId: stopIds[types.indexOf('1')],
-                    payloadLength: newValue.length,
-                    message: 'Validated JSON. PO NOT UPDATED.'
+                    message: 'JSON generated. Purchase Order not saved.'
                 });
                 return;
             }
 
-            // LIVE MODE: Update the PO field.
+            // In live mode, do not save incomplete timestamps.
+            if (warnings.length) {
+                log.audit('SKIPPED - Payload Requires Review', {
+                    poId, docNum, warnings
+                });
+                return;
+            }
+
             record.submitFields({
                 type: record.Type.PURCHASE_ORDER,
                 id: poId,
@@ -257,9 +425,10 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                 }
             });
 
-            log.audit('6 - PO Updated', {
+            log.audit('7 - PO UPDATED SUCCESSFULLY', {
                 poId,
                 docNum,
+                stopIds,
                 oldValue,
                 newValue
             });
@@ -275,10 +444,20 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
     };
 
     const summarize = summary => {
+        let errors = 0;
+
+        summary.mapSummary.errors.iterator().each((key, error) => {
+            errors++;
+            log.error('Map Error - ' + key, error);
+            return true;
+        });
+
         log.audit('Map Reduce Completed', {
-            mode: TEST_MODE ? 'TEST - NO UPDATE' : 'LIVE',
+            mode: TEST_MODE ? 'TEST - ONE PO' : 'LIVE',
             inputError: summary.inputSummary.error || '',
-            mapErrors: [...summary.mapSummary.errors.iterator()]
+            mapErrors: errors,
+            usage: summary.usage,
+            yields: summary.yields
         });
     };
 
