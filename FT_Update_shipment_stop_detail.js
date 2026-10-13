@@ -11,7 +11,7 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
 
     // 2 = Update first 2 POs for testing.
     // 0 = Process ALL POs returned by Search 1.
-    const PO_LIMIT = 2;
+    const PO_LIMIT = 0;
 
     const FIELDS = [
         'name',
