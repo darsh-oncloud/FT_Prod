@@ -43,7 +43,7 @@ define(['N/file', 'N/search', 'N/log'],
 
     const map = context => {
 
-        const refId = JSON.parse(context.value);
+        const refId = String(context.value).trim();
 
         const soSearch = search.create({
             type: search.Type.SALES_ORDER,
