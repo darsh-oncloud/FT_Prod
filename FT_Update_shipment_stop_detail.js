@@ -12,7 +12,7 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
 
     // 2 = Test first 2 POs and update them.
     // 0 = Process ALL POs from saved search.
-    const PO_LIMIT = 2;
+    const PO_LIMIT = 0;
 
     const FIELDS = [
         'name',
@@ -482,6 +482,12 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                 }
             });
 
+log.audit('PO Updated - Shipment Reference IDs', {
+    docNum,
+    pickupRef: payload[0].custrecord_ft_ship_refid,
+    dropoffRef: payload[1].custrecord_ft_ship_refid
+});
+          
             log.audit('PO UPDATED SUCCESSFULLY', {
                 poId,
                 docNum,
