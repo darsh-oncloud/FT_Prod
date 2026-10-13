@@ -1,3 +1,4 @@
+
 /**
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
@@ -6,13 +7,12 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
 
     const PO_SEARCH = 'customsearch3951';
     const STOP_SEARCH = 'customsearch_ft_finding_old_stops';
-
     const TARGET = 'custbody_ft_related_stop_details';
     const UPDATE_CHECKBOX = 'custbody_ft_update_stops';
 
-    // 2 = Test first 2 POs and update them.
-    // 0 = Process ALL POs from saved search.
-    const PO_LIMIT = 0;
+    // 2 = Update first 2 POs for testing.
+    // 0 = Process ALL POs returned by Search 1.
+    const PO_LIMIT = 2;
 
     const FIELDS = [
         'name',
@@ -64,6 +64,12 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
         'custrecord_ft_stop_actualtime'
     ];
 
+    const DATE_TIME_MAP = {
+        custrecord_ft_ship_plandate: 'custrecord_ft_stop_plantime',
+        custrecord_ft_ship_actualdate: 'custrecord_ft_stop_actualtime',
+        custrecord_ft_ship_appt: 'custrecord_ft_shipstop_apptime'
+    };
+
     const formatDate = value => {
         const text = String(value || '').trim();
         const m = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
@@ -82,13 +88,15 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
             /^(\d{1,2}):(\d{2})(?::\d{2})?\s*(am|pm)?$/i
         );
 
-        if (!m) return text;
+        if (!m) return '';
 
         let hour = Number(m[1]);
         const period = (m[3] || '').toLowerCase();
 
         if (period === 'pm' && hour < 12) hour += 12;
         if (period === 'am' && hour === 12) hour = 0;
+
+        if (hour > 23 || Number(m[2]) > 59) return '';
 
         return hour + ':' + m[2];
     };
@@ -110,17 +118,13 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
             ];
         }
 
-        // Production: Return search directly.
-        // NetSuite handles paging and Map/Reduce input.
         if (PO_LIMIT === 0) {
             log.audit('START - ALL POs', {
-                searchId: PO_SEARCH,
-                mode: 'PRODUCTION'
+                searchId: PO_SEARCH
             });
             return s;
         }
 
-        // Test: Only first 2 PO results.
         const results = s.run().getRange({
             start: 0,
             end: PO_LIMIT
@@ -138,7 +142,6 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
         }));
 
         log.audit('TEST - POs Selected', {
-            requested: PO_LIMIT,
             count: input.length,
             input
         });
@@ -171,7 +174,6 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                 if (poId && typeof poId === 'object') {
                     poId = poId.value;
                 }
-
                 if (docNum && typeof docNum === 'object') {
                     docNum = docNum.value;
                 }
@@ -183,10 +185,8 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                 return;
             }
 
-            // SEARCH 2 - Historical Shipment Stops.
-            const oldSearch = search.load({
-                id: STOP_SEARCH
-            });
+            // SEARCH 2: Group by Sequence, MAX Internal ID.
+            const oldSearch = search.load({ id: STOP_SEARCH });
 
             oldSearch.filterExpression = [
                 ['systemnotes.context', 'anyof', 'MPR'],
@@ -194,37 +194,61 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                 ['systemnotes.newvalue', 'startswith', String(docNum)]
             ];
 
-            const oldResults = oldSearch.run().getRange({
-                start: 0,
-                end: 3
+            const seqCol = search.createColumn({
+                name: 'custrecord_ft_ship_seq',
+                summary: search.Summary.GROUP
             });
 
-            const stopIds = oldResults.map(r =>
-                r.getValue({
-                    name: 'internalid',
-                    summary: search.Summary.MAX
-                })
+            const idCol = search.createColumn({
+                name: 'internalid',
+                summary: search.Summary.MAX
+            });
+
+            oldSearch.columns = [seqCol, idCol];
+
+            const oldResults = oldSearch.run().getRange({
+                start: 0,
+                end: 1000
+            });
+
+            const selectedStops = oldResults.map(r => ({
+                sequence: String(r.getValue(seqCol) || ''),
+                internalid: String(r.getValue(idCol) || '')
+            })).sort((a, b) =>
+                Number(a.sequence) - Number(b.sequence)
             );
 
-            // Require exactly 2 unique Shipment Stops.
+            const stopIds = selectedStops.map(s => s.internalid);
+
+            log.audit('Historical Stops - Selected Sequences', {
+                poId,
+                docNum,
+                selectedStops
+            });
+
             if (
-                oldResults.length !== 2 ||
-                stopIds.some(id => !id) ||
-                new Set(stopIds.map(String)).size !== 2
+                selectedStops.length < 2 ||
+                selectedStops.length >= 1000 ||
+                selectedStops.some(s =>
+                    !s.internalid ||
+                    !Number.isInteger(Number(s.sequence)) ||
+                    Number(s.sequence) < 1
+                ) ||
+                new Set(stopIds).size !== stopIds.length
             ) {
-                log.audit('SKIPPED - Invalid Stop Count', {
-                    poId, docNum, stopIds,
-                    count: oldResults.length
+                log.audit('SKIPPED - Invalid Sequence Data', {
+                    poId, docNum, selectedStops
                 });
 
                 report('SKIPPED', {
-                    poId, docNum,
-                    reason: 'Invalid Stop Count'
+                    poId,
+                    docNum,
+                    reason: 'Invalid Sequence Data'
                 });
                 return;
             }
 
-            // SEARCH 3 - Actual Shipment Stop data.
+            // SEARCH 3: Retrieve selected Shipment Stop records.
             const columns = FIELDS.map(id =>
                 search.createColumn({ name: id })
             );
@@ -237,11 +261,11 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                 columns
             }).run().getRange({
                 start: 0,
-                end: 3
+                end: 1000
             });
 
-            if (stopResults.length !== 2) {
-                log.audit('SKIPPED - Missing Stops', {
+            if (stopResults.length !== stopIds.length) {
+                log.audit('SKIPPED - Missing Stop Records', {
                     poId, docNum, stopIds
                 });
 
@@ -253,7 +277,7 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
             }
 
             const stops = stopResults.map(r => {
-                const obj = {};
+                const obj = { internalid: String(r.id) };
 
                 FIELDS.forEach((field, i) => {
                     obj[field] = r.getValue(columns[i]);
@@ -262,35 +286,45 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                 return obj;
             });
 
-            const types = stops.map(s =>
-                String(s.custrecord_ft_ship_type || '')
-            );
+            // Validate selected records match grouped Sequences.
+            const invalidStops = stops.some(s => {
+                const selected = selectedStops.find(x =>
+                    x.internalid === s.internalid
+                );
 
-            const refs = stops.map(s =>
-                String(s.custrecord_ft_ship_refid || '').trim()
-            );
+                const seq = Number(s.custrecord_ft_ship_seq);
+                const type = String(s.custrecord_ft_ship_type || '');
+                const ref = String(s.custrecord_ft_ship_refid || '').trim();
 
-            // Exactly 1 Pickup and 1 Drop Off,
-            // both with valid Shipment Reference IDs.
-            if (
-                !types.includes('1') ||
-                !types.includes('2') ||
-                refs.some(ref =>
-                    !ref || !ref.startsWith(String(docNum) + '_')
-                )
-            ) {
+                return !selected ||
+                    String(selected.sequence) !== String(seq) ||
+                    !ref.startsWith(String(docNum) + '_') ||
+                    !/_(\d+)$/.test(ref) ||
+                    (seq === 1 && type !== '2') ||
+                    (seq > 1 && type !== '1');
+            });
+
+            if (invalidStops) {
                 log.audit('SKIPPED - Invalid Stop Data', {
-                    poId, docNum, stopIds, types, refs
+                    poId,
+                    docNum,
+                    selectedStops,
+                    records: stops.map(s => ({
+                        id: s.internalid,
+                        seq: s.custrecord_ft_ship_seq,
+                        type: s.custrecord_ft_ship_type,
+                        ref: s.custrecord_ft_ship_refid
+                    }))
                 });
 
                 report('SKIPPED', {
                     poId, docNum,
-                    reason: 'Invalid Pickup/Drop Off or Ref ID'
+                    reason: 'Invalid Sequence, Type or Reference ID'
                 });
                 return;
             }
 
-            // Load existing PO field values.
+            // Read current PO JSON and checkbox.
             const po = record.load({
                 type: record.Type.PURCHASE_ORDER,
                 id: poId,
@@ -314,13 +348,10 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                     if (!Array.isArray(existing)) {
                         throw new Error('Existing JSON is not an array');
                     }
-
                 } catch (e) {
                     log.error('SKIPPED - Invalid Existing JSON', {
-                        poId, docNum,
-                        error: e.message
+                        poId, docNum, error: e.message
                     });
-
                     report('SKIPPED', {
                         poId, docNum,
                         reason: 'Invalid Existing JSON'
@@ -331,13 +362,13 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
 
             const warnings = [];
 
-            // Build corrected JSON.
+            // Build one JSON object per unique Sequence.
             const payload = stops.map(stop => {
-                const type = String(stop.custrecord_ft_ship_type);
+                const seq = String(stop.custrecord_ft_ship_seq);
 
                 const previous = existing.find(p =>
                     p &&
-                    String(p.custrecord_ft_ship_type) === type
+                    String(p.custrecord_ft_ship_seq) === seq
                 ) || {};
 
                 const obj = {};
@@ -345,8 +376,7 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                 FIELDS.forEach(field => {
                     let value = stop[field];
 
-                    // Preserve original PO Location Code
-                    // when missing on the Shipment Stop.
+                    // Preserve existing Location Code if missing.
                     if (
                         field === 'custrecord_ft_ship_loccode' &&
                         (value === null ||
@@ -356,8 +386,7 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                         value = previous[field] || '';
                     }
 
-                    // Include all specified fields,
-                    // even when empty.
+                    // Always include empty listed fields.
                     if (
                         value === null ||
                         value === undefined ||
@@ -375,7 +404,7 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                         } else {
                             obj[field] = '';
                             warnings.push(
-                                type + ' Invalid Number: ' + field
+                                'Seq ' + seq + ' Invalid Number: ' + field
                             );
                         }
 
@@ -394,7 +423,6 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                             /^\d{1,2}\/\d{1,2}\/\d{4}\s+(\d{1,2}:\d{2})$/
                         );
 
-                        // Preserve verified original timestamp.
                         if (
                             date &&
                             date === previousDate &&
@@ -403,12 +431,22 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                             obj[field] =
                                 date + ' ' + dateTimeMatch[1];
                         } else {
-                            obj[field] = date;
+                            // New Sequence: reconstruct from Date + Time.
+                            const timeField = DATE_TIME_MAP[field];
+                            const time = formatTime(stop[timeField]);
 
-                            if (date) {
-                                warnings.push(
-                                    type + ' Missing Timestamp: ' + field
-                                );
+                            if (date && time) {
+                                obj[field] = date + ' ' +
+                                    time.padStart(5, '0');
+                            } else {
+                                obj[field] = date || '';
+
+                                if (date) {
+                                    warnings.push(
+                                        'Seq ' + seq +
+                                        ' Missing Timestamp: ' + field
+                                    );
+                                }
                             }
                         }
 
@@ -416,39 +454,28 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                         obj[field] = String(value);
                     }
 
-                    // Get Stop ID from reference suffix.
+                    // Derive Stop ID from Shipment Reference ID.
                     if (field === 'custrecord_ft_ship_refid') {
                         const match = String(value).match(/_(\d+)$/);
 
                         obj.custrecord_ft_stopID =
                             match ? match[1] : '';
-
-                        if (!match) {
-                            warnings.push(
-                                type + ' Invalid Stop Reference ID'
-                            );
-                        }
                     }
                 });
 
                 return obj;
             });
 
-            // Pickup first, Drop Off second.
             payload.sort((a, b) =>
-                Number(b.custrecord_ft_ship_type) -
-                Number(a.custrecord_ft_ship_type)
+                Number(a.custrecord_ft_ship_seq) -
+                Number(b.custrecord_ft_ship_seq)
             );
 
             const newValue = JSON.stringify(payload);
 
-            // Skip if payload has missing required timestamps.
             if (warnings.length) {
                 log.audit('SKIPPED - Payload Warnings', {
-                    poId,
-                    docNum,
-                    stopIds,
-                    warnings
+                    poId, docNum, stopIds, warnings
                 });
 
                 report('SKIPPED', {
@@ -458,17 +485,13 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                 return;
             }
 
-            // Skip if corrected JSON and checkbox already match.
             if (oldValue === newValue && oldCheckbox === true) {
-                log.audit('ALREADY UPDATED', {
-                    poId, docNum
-                });
-
+                log.audit('ALREADY UPDATED', { poId, docNum });
                 report('UNCHANGED', { poId, docNum });
                 return;
             }
 
-            // UPDATE JSON + CHECKBOX IN ONE CALL.
+            // Update JSON and checkbox together.
             record.submitFields({
                 type: record.Type.PURCHASE_ORDER,
                 id: poId,
@@ -482,18 +505,21 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                 }
             });
 
-log.audit('PO Updated - Shipment Reference IDs', {
-    docNum,
-    pickupRef: payload[0].custrecord_ft_ship_refid,
-    dropoffRef: payload[1].custrecord_ft_ship_refid
-});
-          
+            // Separate log containing all Shipment References.
+            log.audit('PO Updated - Shipment Reference IDs', {
+                poId,
+                docNum,
+                references: payload.map(p => ({
+                    sequence: p.custrecord_ft_ship_seq,
+                    referenceId: p.custrecord_ft_ship_refid
+                }))
+            });
+
             log.audit('PO UPDATED SUCCESSFULLY', {
                 poId,
                 docNum,
                 stopIds,
-                pickupRef: payload[0].custrecord_ft_ship_refid,
-                dropoffRef: payload[1].custrecord_ft_ship_refid,
+                sequenceCount: payload.length,
                 oldCheckbox,
                 newCheckbox: true,
                 oldValue,
@@ -503,6 +529,7 @@ log.audit('PO Updated - Shipment Reference IDs', {
             report('UPDATED', {
                 poId,
                 docNum,
+                sequenceCount: payload.length,
                 stopIds
             });
 
@@ -523,7 +550,6 @@ log.audit('PO Updated - Shipment Reference IDs', {
         }
     };
 
-    // Summarize successful, skipped and failed POs.
     const summarize = summary => {
         const counts = {
             UPDATED: 0,
@@ -532,16 +558,11 @@ log.audit('PO Updated - Shipment Reference IDs', {
             FAILED: 0
         };
 
-        const details = [];
-
         summary.output.iterator().each((key, value) => {
             counts[key] = (counts[key] || 0) + 1;
 
             if (key !== 'UPDATED') {
-                details.push({
-                    status: key,
-                    data: JSON.parse(value)
-                });
+                log.audit('PO Result - ' + key, JSON.parse(value));
             }
             return true;
         });
@@ -559,16 +580,7 @@ log.audit('PO Updated - Shipment Reference IDs', {
             seconds: summary.seconds,
             inputError: summary.inputSummary.error || ''
         });
-
-        // Log skipped / failed records individually.
-        details.forEach(item => {
-            log.audit('PO Result - ' + item.status, item.data);
-        });
     };
 
-    return {
-        getInputData,
-        map,
-        summarize
-    };
+    return { getInputData, map, summarize };
 });
