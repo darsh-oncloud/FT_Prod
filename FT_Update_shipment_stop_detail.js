@@ -2,16 +2,21 @@
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
  */
-define(['N/file', 'N/search'], (file, search) => {
+define(['N/file', 'N/search', 'N/log'],
+    (file, search, log) => {
 
-    const FILE_ID = 2777973;
+    const FILE_ID = 21490546;
+    const FOLDER_ID = 2777973;
 
     // 0 = Process all Shipment Reference IDs
+    // 2 = Process first 2 IDs for testing
     const TEST_LIMIT = 0;
 
     const getInputData = () => {
 
-        const csv = file.load({ id: FILE_ID }).getContents();
+        const csv = file.load({
+            id: FILE_ID
+        }).getContents();
 
         const refs = [...new Set(
             csv.replace(/^\uFEFF/, '')
@@ -23,9 +28,17 @@ define(['N/file', 'N/search'], (file, search) => {
                 )
         )];
 
-        return TEST_LIMIT > 0
+        const input = TEST_LIMIT > 0
             ? refs.slice(0, TEST_LIMIT)
             : refs;
+
+        log.audit('Shipment References Loaded', {
+            fileId: FILE_ID,
+            totalReferences: refs.length,
+            processing: input.length
+        });
+
+        return input;
     };
 
     const map = context => {
@@ -41,11 +54,13 @@ define(['N/file', 'N/search'], (file, search) => {
                     'contains', refId]
             ],
             columns: [
-                search.createColumn({ name: 'internalid' })
+                search.createColumn({
+                    name: 'internalid'
+                })
             ]
         });
 
-        // Get all matching Sales Orders for this reference.
+        // Retrieve matching Sales Order Internal IDs.
         soSearch.run().each(result => {
 
             const soId = result.getValue({
@@ -55,7 +70,7 @@ define(['N/file', 'N/search'], (file, search) => {
             if (soId) {
                 context.write({
                     key: String(soId),
-                    value: '1'
+                    value: refId
                 });
             }
 
@@ -65,7 +80,7 @@ define(['N/file', 'N/search'], (file, search) => {
 
     const reduce = context => {
 
-        // Each unique Sales Order ID appears only once.
+        // Each unique Sales Order ID is processed once.
         context.write({
             key: context.key,
             value: context.key
@@ -74,31 +89,36 @@ define(['N/file', 'N/search'], (file, search) => {
 
     const summarize = summary => {
 
-        // Do not generate an incomplete file if a search failed.
-        const errors = [];
+        let errorCount = 0;
 
         if (summary.inputSummary.error) {
-            errors.push(summary.inputSummary.error);
+            errorCount++;
+            log.error('Input Error', summary.inputSummary.error);
         }
 
         summary.mapSummary.errors.iterator().each(
             (key, error) => {
-                errors.push(key + ': ' + error);
+                errorCount++;
+                log.error('Map Error - ' + key, error);
                 return true;
             }
         );
 
         summary.reduceSummary.errors.iterator().each(
             (key, error) => {
-                errors.push(key + ': ' + error);
+                errorCount++;
+                log.error('Reduce Error - ' + key, error);
                 return true;
             }
         );
 
-        if (errors.length) {
-            throw new Error(
-                'Processing failed: ' + errors.slice(0, 5).join('; ')
-            );
+        // Avoid creating incomplete CSV if errors occurred.
+        if (errorCount > 0) {
+            log.error('CSV NOT CREATED', {
+                errorCount,
+                reason: 'One or more searches failed'
+            });
+            return;
         }
 
         const uniqueIds = [];
@@ -110,24 +130,32 @@ define(['N/file', 'N/search'], (file, search) => {
 
         uniqueIds.sort((a, b) => Number(a) - Number(b));
 
-        // Create final CSV containing unique Sales Order IDs.
         const csvContent = [
             'Sales Order Internal ID',
             ...uniqueIds
         ].join('\n');
 
-        const sourceFile = file.load({ id: FILE_ID });
-
+        // Save final CSV in the requested folder.
         const outputFile = file.create({
             name: 'Unique_Sales_Order_IDs_' +
                 new Date().toISOString()
                     .replace(/[:.]/g, '-') + '.csv',
             fileType: file.Type.CSV,
             contents: csvContent,
-            folder: sourceFile.folder
+            folder: FOLDER_ID
         });
 
-        outputFile.save();
+        const outputFileId = outputFile.save();
+
+        log.audit('FINAL CSV CREATED SUCCESSFULLY', {
+            outputFileId,
+            folderId: FOLDER_ID,
+            totalUniqueSalesOrders: uniqueIds.length,
+            fileName: outputFile.name,
+            seconds: summary.seconds,
+            usage: summary.usage,
+            yields: summary.yields
+        });
     };
 
     return {
