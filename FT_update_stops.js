@@ -10,6 +10,7 @@ define(['N/record', 'N/log', 'N/search', 'N/file'], function(record, log, search
         var oldRecord = context.oldRecord;
         var recId = newRecord.id;
         var recType = newRecord.type;
+        var tranId = newRecord.getValue({fieldId:'tranid'});
 
 
         // if (recId != 9135041 && recType == 'salesorder') return;
@@ -52,7 +53,7 @@ define(['N/record', 'N/log', 'N/search', 'N/file'], function(record, log, search
                   record.submitFields({type:recType,id:recId,values:{custbody_ft_update_stops: true}})
 
                   // NEW - Save stops payload history
-                  saveStopsPayloadHistory(recType, recId, newStopDetails);                  
+                  saveStopsPayloadHistory(recType, recId, newStopDetails, tranId);                  
 
                     log.debug({
                         title: 'Field Updated on Create',
@@ -81,7 +82,7 @@ define(['N/record', 'N/log', 'N/search', 'N/file'], function(record, log, search
                     record.submitFields({type:recType,id:recId,values:{custbody_ft_update_stops: true}})
 	
                     // NEW - Append changed stops payload
-                    if (newStopDetails) saveStopsPayloadHistory(recType, recId, newStopDetails);                  
+                    if (newStopDetails) saveStopsPayloadHistory(recType, recId, newStopDetails, tranId);                  
 
                     log.debug({
                         title: 'Field Updated on Edit',
@@ -98,7 +99,7 @@ define(['N/record', 'N/log', 'N/search', 'N/file'], function(record, log, search
     }
 
     // NEW - Create or append stops payload history file
-    function saveStopsPayloadHistory(recType, recId, payload) {
+    function saveStopsPayloadHistory(recType, recId, payload, tranId) {
         if (recType != 'purchaseorder' && recType != 'salesorder') return;
         try {
             var fieldId = 'custbody_stops_json_payload';
@@ -106,7 +107,7 @@ define(['N/record', 'N/log', 'N/search', 'N/file'], function(record, log, search
             var timestamp = new Date().toISOString();
             var entry = '// ' + timestamp + '\n' + String(payload) + '\n';
             var f = existingId ? file.load({id:existingId}) : file.create({
-                name: recType + '_' + recId + '_Stops_Payload_History.txt',
+                name: recType + '_' + tranId + '_Stops_Payload_History.txt',
                 fileType: file.Type.PLAINTEXT,
                 contents: entry,
                 folder: 2788915
