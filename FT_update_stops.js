@@ -3,14 +3,13 @@
  * @NScriptType UserEventScript
  * @NModuleScope SameAccount
  */
-define(['N/record', 'N/log', 'N/search', 'N/file'], function(record, log, search, file) {
+define(['N/record', 'N/log', 'N/search'], function(record, log, search) {
 
     function afterSubmit(context) {
         var newRecord = context.newRecord;
         var oldRecord = context.oldRecord;
         var recId = newRecord.id;
         var recType = newRecord.type;
-        var tranId = newRecord.getValue({fieldId:'tranid'});
 
 
         // if (recId != 9135041 && recType == 'salesorder') return;
@@ -52,9 +51,6 @@ define(['N/record', 'N/log', 'N/search', 'N/file'], function(record, log, search
 
                   record.submitFields({type:recType,id:recId,values:{custbody_ft_update_stops: true}})
 
-                  // NEW - Save stops payload history
-                  saveStopsPayloadHistory(recType, recId, newStopDetails, tranId);                  
-
                     log.debug({
                         title: 'Field Updated on Create',
                         details: 'Field custbody_ft_related_stop_details has a value. custbody_ft_update_stops set to true.'
@@ -80,9 +76,6 @@ define(['N/record', 'N/log', 'N/search', 'N/file'], function(record, log, search
                 try {
 
                     record.submitFields({type:recType,id:recId,values:{custbody_ft_update_stops: true}})
-	
-                    // NEW - Append changed stops payload
-                    if (newStopDetails) saveStopsPayloadHistory(recType, recId, newStopDetails, tranId);                  
 
                     log.debug({
                         title: 'Field Updated on Edit',
@@ -97,33 +90,6 @@ define(['N/record', 'N/log', 'N/search', 'N/file'], function(record, log, search
             }
         }
     }
-
-    // NEW - Create or append stops payload history file
-    function saveStopsPayloadHistory(recType, recId, payload, tranId) {
-        if (recType != 'purchaseorder' && recType != 'salesorder') return;
-        try {
-            var fieldId = 'custbody_stops_json_payload';
-            var existingId = record.load({type:recType, id:recId}).getValue({fieldId:fieldId});
-            var timestamp = new Date().toISOString();
-            var entry = '// ' + timestamp + '\n' + String(payload) + '\n';
-            var f = existingId ? file.load({id:existingId}) : file.create({
-                name: recType + '_' + tranId + '_Stops_Payload_History.txt',
-                fileType: file.Type.PLAINTEXT,
-                contents: entry,
-                folder: 2788915
-            });
-            if (existingId) f.appendLine({value:'\n' + entry});
-            var fileId = f.save();
-            if (String(existingId || '') !== String(fileId)) {
-                var values = {};
-                values[fieldId] = fileId;
-                record.submitFields({type:recType, id:recId, values:values, options:{ignoreMandatoryFields:true}});
-            }
-            log.audit('Stops Payload History Saved', {recType:recType, recId:recId, fileId:fileId});
-        } catch (e) {
-            log.error('Stops Payload History Error', e.toString());
-        }
-    }  
 
   function get_so_id(so_externalid){
     var returnid = '';
