@@ -245,13 +245,26 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
     }
     
     // Location from Pool mapping; fall back to Walmart Pool mapping record
-    const locationId = getPoolLocation(row.custrecord_ft_pool) || row.mapping.location || '';
+    const locationId = getPoolLocation(row.mapping.location) || row.mapping.location || '';
     if (!locationId) {
       throw new Error('No location mapping for Pool: ' + row.custrecord_ft_pool);
     }
     rec.setValue('custrecord_ft_grs_location', locationId);
     rec.setValue('custrecord_ft_twovsthree_week_category', row.mapping.weeks || '');
     rec.setValue('custrecord_ft_walmart_grs_mapping', row.mapping.internalid || '');
+
+    var adjMabd = rec.getValue('custrecord_ft_adj_mabd');
+
+    rec.setValue('externalid',
+         row.custrecord_ft_vendor_number + '_' +
+         row.name + '_' +
+         row.custrecord_ft_item_number + '_' +
+         (adjMabd
+             ? adjMabd.getFullYear() + '-' +
+               String(adjMabd.getMonth() + 1).padStart(2, '0') + '-' +
+               String(adjMabd.getDate()).padStart(2, '0')
+             : '')
+    );
     
     return rec.save();
   }
