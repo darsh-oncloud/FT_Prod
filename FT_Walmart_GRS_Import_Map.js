@@ -15,7 +15,7 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
 
   const FOLDER_ID = 1943095;
   const PROCESSED_FOLDER_ID = 1943096;
-  const ERROR_FOLDER_ID = 0; // TODO: set Error folder internal id
+  const ERROR_FOLDER_ID = 2814808; 
   const RECORD_TYPE = 'customrecord_ft_walmart_grs';
   const LOCATION_MASTER_TYPE = 'customrecord_ft_location_master';
   const RETAILER_POOL_WALMART = '1';
