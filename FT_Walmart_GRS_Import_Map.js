@@ -43,6 +43,8 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
   // Field types used when comparing existing vs new values
   const DATE_FIELDS = ['custrecord_ft_mabd', 'custrecord_ft_adj_mabd'];
   const NUMBER_FIELDS = ['custrecord_ft_order_quantity', 'custrecord_ft_weight_quantity', 'custrecord_ft_cube_quantity'];
+  // List fields whose IDs differ between the mapping and the GRS record -> compare/update by display text
+  const TEXT_COMPARE_FIELDS = ['custrecord_ft_twovsthree_week_category'];
 
   // Normalize DC numbers so "06094" and "6094" match
   function normDC(val) {
@@ -73,6 +75,7 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
         mappingCache[result.getValue('custrecord_ft_wmgrsmap_externalid')] = {
           location: result.getValue('custrecord_ft_wmgrsmap_location'),
           weeks: result.getValue('custrecord_ft_wmgrsmap_weeks'),
+          weeksText: result.getText('custrecord_ft_wmgrsmap_weeks') || result.getValue('custrecord_ft_wmgrsmap_weeks'),
           internalid: result.getValue('internalid')
         };
         return true;
@@ -261,12 +264,25 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
     const rec = record.load({ type: RECORD_TYPE, id: existingId });
     const changes = [];
 
-    Object.keys(values).forEach(f => {
-      const oldV = normForCompare(f, rec.getValue(f));
-      const newV = normForCompare(f, values[f]);
-      if (oldV !== newV) {
-        changes.push({ field: f, from: oldV, to: newV });
-        rec.setValue(f, values[f]);
+    // Normal fields: compare by value
+    Object.keys(values)
+      .filter(f => TEXT_COMPARE_FIELDS.indexOf(f) === -1)
+      .forEach(f => {
+        const oldV = normForCompare(f, rec.getValue(f));
+        const newV = normForCompare(f, values[f]);
+        if (oldV !== newV) {
+          changes.push({ field: f, from: oldV, to: newV });
+          rec.setValue(f, values[f]);
+        }
+      });
+
+    // List fields: compare by display text (e.g. "2" vs "2")
+    TEXT_COMPARE_FIELDS.forEach(f => {
+      const oldT = String(rec.getText(f) || '').trim();
+      const newT = String(built.texts[f] || '').trim();
+      if (newT && oldT !== newT) {
+        changes.push({ field: f, from: oldT, to: newT });
+        rec.setText(f, newT);
       }
     });
 
@@ -327,7 +343,12 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
       row.custrecord_ft_item_number + '_' +
       (adjMabd ? ymd(adjMabd) : '');
 
-    return { extId, values };
+    // Display text for list fields compared by text on update
+    const texts = {
+      custrecord_ft_twovsthree_week_category: row.mapping.weeksText || ''
+    };
+
+    return { extId, values, texts };
   }
 
   // Returns internal id of existing record with this external id, or null
