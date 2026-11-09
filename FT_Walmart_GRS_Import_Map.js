@@ -10,7 +10,7 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
   // true  = nothing is created/updated, files are NOT moved, results only logged
   // false = LIVE: create/update records, move files, send email
   // ---------------------------------------------------------------------------
-  const DRY_RUN = true;
+  const DRY_RUN = false;
   const SEND_EMAIL_IN_DRY_RUN = false; // set true if you also want the email during dry run
 
   const FOLDER_ID = 1943095;
