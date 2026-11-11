@@ -16,6 +16,8 @@ define(['N/file', 'N/search', 'N/record', 'N/runtime', 'N/log'], function (file,
         CUSTOMER_ID: 972653,                                 // Hardcoded Customer ID
         LOCATION_ID: 32,                                     // Hardcoded Location ID (CA2)
         MG_SOURCE_SYSTEM_ID: 2,                               // custentity_ft_sourcesystem value ID for MG
+        SYNAPSE_SOURCE_SYSTEM_ID: 3,                          // custentity_ft_sourcesystem value ID for Synapse  >>> VERIFY IN ACCOUNT <<<
+        RELATED_SO_FIELD: 'custbody_related_whtrans_sales_or', // Body field used to cross-link the MG and Synapse SOs
         CUST_REF_RECORD_TYPE: 'customrecord_ft_cust_references',
         CUST_REF_QUALIFIER_SID: 1,                            // custrecord_ft_cr_qualifier internal id for "SID"
         CUST_REF_QUALIFIER_PO: 2,                             // custrecord_ft_cr_qualifier internal id for "PO Number"
@@ -194,28 +196,36 @@ customerSearchObj.run().each(function(result){
 
     /**
      * Helper: Find the subcustomer under a parent customer that matches a given
-     * Source System (custentity_ft_sourcesystem) and has Primary Transportation
-     * Record (custentity_ft_cus_primary_transpo_record) checked.
+     * Source System (custentity_ft_sourcesystem). Optionally also requires
+     * Primary Transportation Record (custentity_ft_cus_primary_transpo_record)
+     * to be checked.
      *
-     * Used when the parent customer's MG Order checkbox is checked: the Sales
-     * Order should be created against this subcustomer rather than the parent.
+     * - MG plan:      source system = MG (2),      Primary Transpo Record required
+     * - Synapse plan: source system = Synapse (3), Primary Transpo Record NOT required
      *
      * @param {string|number} parentCustomerId
-     * @param {number} sourceSystemId - custentity_ft_sourcesystem list value ID (e.g. 2 = MG)
+     * @param {number} sourceSystemId - custentity_ft_sourcesystem list value ID
+     * @param {boolean} [requirePrimaryTranspo=true] - add the Primary Transportation Record filter
      * @returns {number|null} internal ID of the matching subcustomer, or null
      */
-    function findSubcustomerByType(parentCustomerId, sourceSystemId) {
+    function findSubcustomerByType(parentCustomerId, sourceSystemId, requirePrimaryTranspo) {
         if (!parentCustomerId || !sourceSystemId) return null;
+        const usePrimaryTranspo = requirePrimaryTranspo !== false;
         try {
+            const filters = [
+                ['parent', 'anyof', String(parentCustomerId)],
+                'AND',
+                ['custentity_ft_sourcesystem', 'anyof', String(sourceSystemId)],
+                'AND',
+                ['isinactive', 'is', 'F']
+            ];
+            if (usePrimaryTranspo) {
+                filters.push('AND', ['custentity_ft_cus_primary_transpo_record', 'is', 'T']);
+            }
+
             const subSearch = search.create({
                 type: search.Type.CUSTOMER,
-                filters: [
-                    ['parent', 'anyof', String(parentCustomerId)],
-                    'AND',
-                    ['custentity_ft_sourcesystem', 'anyof', String(sourceSystemId)],
-                    'AND',
-                    ['custentity_ft_cus_primary_transpo_record', 'is', 'T']
-                ],
+                filters: filters,
                 columns: ['internalid']
             });
 
@@ -224,15 +234,68 @@ customerSearchObj.run().each(function(result){
                 return Number(results[0].id);
             }
 
-            log.error('MG Subcustomer Not Found', `No subcustomer found under parent ${parentCustomerId} with source system ${sourceSystemId} and Primary Transportation Record checked.`);
+            log.error('Subcustomer Not Found', `No subcustomer found under parent ${parentCustomerId} with source system ${sourceSystemId}` +
+                (usePrimaryTranspo ? ' and Primary Transportation Record checked.' : '.'));
         } catch (e) {
-            log.error('Error searching MG subcustomer', {
+            log.error('Error searching subcustomer', {
                 parentCustomerId: parentCustomerId,
                 sourceSystemId: sourceSystemId,
+                requirePrimaryTranspo: usePrimaryTranspo,
                 error: e
             });
         }
         return null;
+    }
+
+    /**
+     * Helper: Cross-link the MG and Synapse Sales Orders created for the same SID.
+     * Sets CONFIG.RELATED_SO_FIELD on each order to point at the other one.
+     *
+     * @param {number} mgSoId
+     * @param {number} synapseSoId
+     * @param {string} sid - for logging
+     */
+    function linkRelatedSalesOrders(mgSoId, synapseSoId, sid) {
+        if (!mgSoId || !synapseSoId) return;
+
+        const links = [
+            { soId: mgSoId, relatedId: synapseSoId, label: 'MG -> Synapse' },
+            { soId: synapseSoId, relatedId: mgSoId, label: 'Synapse -> MG' }
+        ];
+
+        links.forEach(function (link) {
+            try {
+                const values = {};
+                values[CONFIG.RELATED_SO_FIELD] = Number(link.relatedId);
+
+                record.submitFields({
+                    type: record.Type.SALES_ORDER,
+                    id: Number(link.soId),
+                    values: values,
+                    options: {
+                        enableSourcing: false,
+                        ignoreMandatoryFields: true
+                    }
+                });
+
+                log.audit('Related Sales Order Linked', {
+                    sid: sid,
+                    direction: link.label,
+                    soId: link.soId,
+                    relatedSoId: link.relatedId,
+                    field: CONFIG.RELATED_SO_FIELD
+                });
+            } catch (e) {
+                log.error('Failed To Link Related Sales Order', {
+                    sid: sid,
+                    direction: link.label,
+                    soId: link.soId,
+                    relatedSoId: link.relatedId,
+                    field: CONFIG.RELATED_SO_FIELD,
+                    error: e.message || e.toString()
+                });
+            }
+        });
     }
 
     // Helper: Search Item Master Alias first, then fallback to WH Master Item List
@@ -244,13 +307,16 @@ customerSearchObj.run().each(function(result){
         * STEP 1:
         * First search from Item Master Alias
         */
+      log.debug('findWHMasterRecord',cleanItemCode)
+            log.debug('customerId',customerId)
+
         try {
             const aliasSearch = search.create({
                 type: 'customrecord_ft_item_master_alias',
                 filters: [
                     ['name', 'is', cleanItemCode],
                     'AND',
-                    ['custrecord_ft_alias_item.custrecord_ft_item_mas_customer', 'anyof', String(customerId)]
+                    ['custrecord_ft_item_alias_customer', 'anyof', String(customerId)]
                 ],
                 columns: [
                     search.createColumn({ name: 'name', label: 'Name' }),
@@ -360,30 +426,6 @@ customerSearchObj.run().each(function(result){
             });
         }
 
-        return null;
-    }
-
-    // Helper: Search NetSuite location by custrecord_ft_loc_short_key custom field
-    function findLocationByKey(key) {
-        if (!key) return null;
-        try {
-            const cleanKey = key.trim();
-            const locSearch = search.create({
-                type: search.Type.LOCATION,
-                filters: [
-                    ['custrecord_ft_loc_short_key', 'is', cleanKey]
-                ],
-                columns: ['internalid']
-            });
-            const results = locSearch.run().getRange({ start: 0, end: 1 });
-            if (results && results.length > 0) {
-                log.debug('findLocationByKey Match', { searchedKey: cleanKey, foundLocationId: results[0].id });
-                return results[0].id;
-            }
-            log.debug('findLocationByKey No Match', { searchedKey: cleanKey, message: 'No location found with this custrecord_ft_loc_short_key value.' });
-        } catch (e) {
-            log.error(`Error searching location for key: ${key}`, e);
-        }
         return null;
     }
 
@@ -767,12 +809,12 @@ customerSearchObj.run().each(function(result){
 
         let orderLocationId = CONFIG.LOCATION_ID;
         if (locationKey) {
-            const foundLocId = findLocationByKey(locationKey);
+            const foundLocId = findLocationByText(locationKey);
             if (foundLocId) {
                 orderLocationId = foundLocId;
-                log.audit('Location Mapped', `Mapped location key "${locationKey}" to NetSuite Location ID: ${orderLocationId}`);
+                log.audit('Location Mapped', `Mapped location name "${locationKey}" to NetSuite Location ID: ${orderLocationId}`);
             } else {
-                log.audit('Location Fallback', `Location key "${locationKey}" not found in NetSuite. Using default: ${orderLocationId}`);
+                log.audit('Location Fallback', `Location name "${locationKey}" not found in NetSuite. Using default: ${orderLocationId}`);
             }
         } else {
             log.debug('No Location Key', `No location key found for type: "${typeVal}". Using default: ${orderLocationId}`);
@@ -883,11 +925,11 @@ try {
                             }
                         } else if (nsFieldId === 'entity') {
                             // Never let the dynamic CSV mapping override the entity we
-                            // already resolved (parent customer vs. MG subcustomer above).
+                            // already resolved (parent customer vs. MG/Synapse subcustomer above).
                             log.audit('Header Entity Mapping Skipped', {
                                 csvHeader: csvHeader,
                                 csvValue: csvValue,
-                                message: 'Ignoring mapped "entity" field from soMapping; entity is controlled by MG subcustomer resolution logic.'
+                                message: 'Ignoring mapped "entity" field from soMapping; entity is controlled by MG/Synapse subcustomer resolution logic.'
                             });
                         } else if (nsFieldId === 'location') {
                             const foundLocId = findLocationByText(csvValue);
@@ -905,7 +947,7 @@ try {
                             } else {
                                 log.error('Header Location Not Found', {
                                     csvValue: csvValue,
-                                    message: 'No active NetSuite Location found by CSV text/name or internal ID.'
+                                    message: 'No active NetSuite Location found by CSV name.'
                                 });
                             }
                         } else {
@@ -963,6 +1005,9 @@ try {
             if (firstRow['SHIP FROM SHORT KEY']) {
                 soRec.setValue({ fieldId: 'custbody_ft_shiploccode', value: firstRow['SHIP FROM SHORT KEY'] });
             }
+            if (firstRow['SHIP FROM NAME']) {
+                soRec.setValue({ fieldId: 'custbody_ft_shipfraddressee', value: firstRow['SHIP FROM NAME'] });
+            }
             if (firstRow['SHIP FROM ADDRESS1']) {
                 soRec.setValue({ fieldId: 'custbody_ft_shipfromadd1', value: firstRow['SHIP FROM ADDRESS1'] });
             }
@@ -998,7 +1043,19 @@ try {
             }
         }
 
-        // Add Sublist Items according to this plan (MG -> item 8797 (SB) 8899 (Prod), Synapse -> item 2990)
+        // Apply these explicit CSV mappings after configurable mappings so they take precedence.
+        const requestedHeaderMappings = [
+            { value: firstRow.__csvColumnG, fieldId: 'custbody_ft_depordernum' },
+            { value: firstRow.__csvColumnH, fieldId: 'custbody_ft_customerprimaryref' },
+            { value: firstRow['SHIP TO NAME'], fieldId: 'custbody_ft_consignaddressee' }
+        ];
+        requestedHeaderMappings.forEach(function (mapping) {
+            if (mapping.value !== undefined && mapping.value !== null && String(mapping.value).trim() !== '') {
+                soRec.setValue({ fieldId: mapping.fieldId, value: String(mapping.value).trim() });
+            }
+        });
+
+        // Add Sublist Items according to this plan (MG -> item 8899 (Prod), Synapse -> item 2990)
         addOrderItems(soRec, orderLocationId, plan.includeMG, plan.includeSynapse);
 
         // Re-apply header location right before saving to prevent Dynamic Mode sourcing from clearing it.
@@ -1008,6 +1065,8 @@ try {
         // and protected from the CSV mapping loop above; it must not be touched again after
         // addOrderItems() runs.
         soRec.setValue({ fieldId: 'location', value: orderLocationId });
+        // Use the same resolved warehouse location for the consolidation point.
+        //soRec.setValue({ fieldId: 'custbody_ft_consolidationpoint', value: Number(orderLocationId) });
 
         // Set Customer Method for orders that include Synapse.
 if (plan.includeSynapse) {
@@ -1232,6 +1291,10 @@ if (plan.includeSynapse) {
                     row[header[c]] = (c < columns.length ? columns[c].trim() : '');
                 }
 
+                // Preserve the requested positional columns even if their header labels vary.
+                row.__csvColumnG = columns.length > 6 ? columns[6].trim() : '';
+                row.__csvColumnH = columns.length > 7 ? columns[7].trim() : '';
+
                 log.debug('CSV Row Parsed', {
                     lineIndex: lineIndex,
                     columnCount: columns.length,
@@ -1303,7 +1366,6 @@ if (plan.includeSynapse) {
 
         let dropdownMappings = {
             'custrecord_ft_invitem_freightclass': 'customlist_nmfc_codes',
-            'custrecord_ft_invitem_contract_type': 'customlist_inventory_item_contract_typ',
             'custrecord_ft_invitem_uom': 'customlist1488'
         };
         if (dropdownMappingStr) {
@@ -1326,7 +1388,8 @@ if (plan.includeSynapse) {
             rows.forEach(row => {
                 let populatedCount = 0;
                 for (const key in row) {
-                    if (row[key] !== undefined && row[key] !== null && row[key] !== '') {
+                    if (key !== '__csvColumnG' && key !== '__csvColumnH' &&
+                        row[key] !== undefined && row[key] !== null && row[key] !== '') {
                         populatedCount++;
                     }
                 }
@@ -1371,10 +1434,11 @@ if (plan.includeSynapse) {
             log.audit('Customer Order Flags', { customerId: customerId, mg: orderFlags.mg, synapse: orderFlags.synapse });
 
             // Decide which Sales Order(s) to build based on the flags:
-            // - Neither checked      -> 1 order, both items (8797 + 2990), externalid = SID           (original behavior)
-            // - Only MG checked      -> 1 order, item 8797 only,          externalid = SID_MG
-            // - Only Synapse checked -> 1 order, item 2990 only,          externalid = SID_SYN
-            // - Both checked         -> 2 separate orders (SID_MG w/ 8797, SID_SYN w/ 2990)
+            // - Neither checked      -> 1 order, both items (8899 + 2990), externalid = SID, entity = parent (original behavior)
+            // - Only MG checked      -> 1 order, item 8899 only, externalid = SID_MG,  entity = MG subcustomer
+            // - Only Synapse checked -> 1 order, item 2990 only, externalid = SID_SYN, entity = Synapse subcustomer
+            // - Both checked         -> 2 separate orders (SID_MG, then SID_SYN), cross-linked via
+            //                           custbody_related_whtrans_sales_or
             let orderPlans;
             if (orderFlags.mg && orderFlags.synapse) {
                 orderPlans = [
@@ -1413,17 +1477,24 @@ if (plan.includeSynapse) {
                 // Default: the Sales Order's entity is the parent customer from the file.
                 let entityId = customerId;
 
-                // If this is an MG plan (parent customer's MG Order checkbox is checked),
-                // the SO must instead be created under the subcustomer that has
-                // custentity_ft_sourcesystem = MG (2) and
-                // custentity_ft_cus_primary_transpo_record checked.
                 if (plan.typeKey === 'MG') {
-                    const mgSubcustomerId = findSubcustomerByType(customerId, CONFIG.MG_SOURCE_SYSTEM_ID);
+                    // MG plan: use the subcustomer with custentity_ft_sourcesystem = MG (2)
+                    // and custentity_ft_cus_primary_transpo_record checked.
+                    const mgSubcustomerId = findSubcustomerByType(customerId, CONFIG.MG_SOURCE_SYSTEM_ID, true);
                     if (mgSubcustomerId) {
                         entityId = mgSubcustomerId;
                         log.audit('MG Subcustomer Resolved', `SID ${sid}: using subcustomer ${mgSubcustomerId} (parent ${customerId}) as Sales Order entity.`);
                     } else {
                         log.error('MG Subcustomer Fallback', `SID ${sid}: no matching MG subcustomer found under parent ${customerId}. Falling back to parent customer as entity.`);
+                    }
+                } else if (plan.typeKey === 'SYN') {
+                    // Synapse plan: use the subcustomer with custentity_ft_sourcesystem = Synapse.
+                    const synSubcustomerId = findSubcustomerByType(customerId, CONFIG.SYNAPSE_SOURCE_SYSTEM_ID, false);
+                    if (synSubcustomerId) {
+                        entityId = synSubcustomerId;
+                        log.audit('Synapse Subcustomer Resolved', `SID ${sid}: using subcustomer ${synSubcustomerId} (parent ${customerId}) as Sales Order entity.`);
+                    } else {
+                        log.error('Synapse Subcustomer Fallback', `SID ${sid}: no matching Synapse subcustomer found under parent ${customerId}. Falling back to parent customer as entity.`);
                     }
                 }
 
@@ -1439,6 +1510,12 @@ if (plan.includeSynapse) {
                     }
                 }
             });
+
+            // When both MG and Synapse orders were created for this SID, cross-link them
+            // via custbody_related_whtrans_sales_or (MG -> Synapse and Synapse -> MG).
+            if (mgSoId && synapseSoId) {
+                linkRelatedSalesOrders(mgSoId, synapseSoId, sid);
+            }
 
             // if (skipInventoryItemCreation) {
             //     log.audit('Inventory Item Creation Skipped', `Skipped custom inventory item creation for SID ${sid} because separate MG and Synapse orders were created.`);
@@ -1623,11 +1700,6 @@ if (plan.includeSynapse) {
 
         const searchText = String(locationText).trim();
         if (!searchText) return null;
-
-        // If CSV already contains internal ID
-        if (!isNaN(Number(searchText))) {
-            return Number(searchText);
-        }
 
         function normalize(value) {
             return String(value || '')
