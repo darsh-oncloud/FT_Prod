@@ -528,7 +528,7 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
         ' | ' + r.movedTo);
     });
 
-    if (!DRY_RUN || SEND_EMAIL_IN_DRY_RUN) sendResultEmail(results);
+   // if (!DRY_RUN || SEND_EMAIL_IN_DRY_RUN) sendResultEmail(results);
   }
 
   function sendResultEmail(results) {
