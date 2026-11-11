@@ -429,48 +429,115 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
         log.error('File move failed', fileId + ': ' + moveErr.message);
         movedTo = 'NOT MOVED (' + moveErr.message + ')';
       }
-    } else {
-      // Errors -> write a copy with an "Error" column into the Error folder
-      movedTo = 'Error';
-      try {
+    //  } else {
+    //   // Errors -> write a copy with an "Error" column into the Error folder
+    //   movedTo = 'Error';
+    //   try {
+    //     const original = file.load({ id: fileId });
+
+    //     // line number -> error message
+    //     const errByLine = {};
+    //     errors.forEach(e => {
+    //       if (e.lineNo) errByLine[e.lineNo] = (errByLine[e.lineNo] ? errByLine[e.lineNo] + ' | ' : '') + e.message;
+    //     });
+
+    //     const lines = original.getContents().split(/\r?\n/);
+    //     const out = lines.map((line, idx) => {
+    //       if (line.trim() === '') return line;
+    //       const lineNo = idx + 1;
+    //       if (errByLine[lineNo]) return line + ',' + csvCell(errByLine[lineNo]); // failed row
+    //       if (idx === 0 && /Internal ID"?\s*$/.test(line)) return line + ',Error'; // header of update file
+    //       return line + ',';                                                       // good row -> blank
+    //     });
+
+    //     const errFile = file.create({
+    //       name: original.name,
+    //       fileType: file.Type.CSV,
+    //       contents: out.join('\n'),
+    //       folder: ERROR_FOLDER_ID
+    //     });
+    //     const newId = errFile.save();
+    //     file.delete({ id: fileId }); // remove original from inbound folder
+    //     movedTo = 'Error (file ' + newId + ')';
+    //   } catch (moveErr) {
+    //     // Fallback: couldn't rewrite (e.g. unreadable file) -> just move it as before
+    //     log.error('Error file rewrite failed', fileId + ': ' + moveErr.message);
+    //     try {
+    //       const f = file.load({ id: fileId });
+    //       f.folder = ERROR_FOLDER_ID;
+    //       f.save();
+    //     } catch (e2) {
+    //       movedTo = 'NOT MOVED (' + e2.message + ')';
+    //     }
+    //   }
+    // }
+    
+} else {
+    // Errors -> update original CSV with Error column and move it
+    movedTo = 'Error';
+
+    try {
         const original = file.load({ id: fileId });
 
-        // line number -> error message
+        // Map each failed row to its error message
         const errByLine = {};
         errors.forEach(e => {
-          if (e.lineNo) errByLine[e.lineNo] = (errByLine[e.lineNo] ? errByLine[e.lineNo] + ' | ' : '') + e.message;
+            if (e.lineNo) {
+                errByLine[e.lineNo] =
+                    (errByLine[e.lineNo] ? errByLine[e.lineNo] + ' | ' : '') +
+                    e.message;
+            }
         });
 
         const lines = original.getContents().split(/\r?\n/);
+
+        // Append Error column to original CSV contents
         const out = lines.map((line, idx) => {
-          if (line.trim() === '') return line;
-          const lineNo = idx + 1;
-          if (errByLine[lineNo]) return line + ',' + csvCell(errByLine[lineNo]); // failed row
-          if (idx === 0 && /Internal ID"?\s*$/.test(line)) return line + ',Error'; // header of update file
-          return line + ',';                                                       // good row -> blank
+            if (line.trim() === '') return line;
+
+            const lineNo = idx + 1;
+
+            if (idx === 0) {
+                return line + ',Error';
+            }
+
+            if (errByLine[lineNo]) {
+                return line + ',' + csvCell(errByLine[lineNo]);
+            }
+
+            return line + ',';
         });
 
-        const errFile = file.create({
-          name: original.name,
-          fileType: file.Type.CSV,
-          contents: out.join('\n'),
-          folder: ERROR_FOLDER_ID
-        });
-        const newId = errFile.save();
-        file.delete({ id: fileId }); // remove original from inbound folder
-        movedTo = 'Error (file ' + newId + ')';
-      } catch (moveErr) {
-        // Fallback: couldn't rewrite (e.g. unreadable file) -> just move it as before
-        log.error('Error file rewrite failed', fileId + ': ' + moveErr.message);
-        try {
-          const f = file.load({ id: fileId });
-          f.folder = ERROR_FOLDER_ID;
-          f.save();
-        } catch (e2) {
-          movedTo = 'NOT MOVED (' + e2.message + ')';
-        }
-      }
+        // Update SAME original file, no delete or new file
+        // original.contents = out.join('\n');
+        // original.folder = ERROR_FOLDER_ID;
+const errorFile = file.create({
+    name: original.name,
+    fileType: file.Type.CSV,
+    contents: out.join('\n'),
+    folder: ERROR_FOLDER_ID
+});
+        const savedFileId = errorFile.save();
+
+        movedTo = 'Error (file ' + savedFileId + ')';
+
+        log.audit('ERROR FILE UPDATED',
+            'File: ' + meta.fileName +
+            ' | File ID: ' + savedFileId +
+            ' | Errors: ' + errors.length
+        );
+
+    } catch (moveErr) {
+        log.error('Error file update failed',
+            'File: ' + meta.fileName +
+            ' | File ID: ' + fileId +
+            ' | Error: ' + moveErr.message
+        );
+
+        movedTo = 'ERROR FILE UPDATE FAILED';
     }
+}
+  
     errors.sort((a, b) => a.lineNo - b.lineNo);
 
     context.write({
