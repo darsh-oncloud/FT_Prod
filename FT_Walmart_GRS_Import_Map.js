@@ -119,6 +119,7 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
             if (line.trim() === '') return;
 
             const cols = splitCSV(line);
+            if (String(cols[0]).toUpperCase() === 'POOL') return; // skip header row
             const lastCol = cols[cols.length - 1];
             if (!isUpdate) isUpdate = lastCol == 'Internal ID';
             if (lastCol == 'Internal ID') return; // header of update file
@@ -509,7 +510,7 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
             }
 
             if (idx === 0) {
-                return line + ',Error';
+                return line + ',ERRORS';
             }
             return line + ',';
         });
