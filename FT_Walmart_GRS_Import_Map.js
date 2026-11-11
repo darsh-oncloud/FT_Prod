@@ -497,14 +497,20 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
 
             const lineNo = idx + 1;
 
-            if (idx === 0) {
-                return line + ',Error';
-            }
+            // if (idx === 0) {
+            //     return line + ',Error';
+            // }
 
+            // if (errByLine[lineNo]) {
+            //     return line + ',' + csvCell(errByLine[lineNo]);
+            // }
             if (errByLine[lineNo]) {
                 return line + ',' + csvCell(errByLine[lineNo]);
             }
 
+            if (idx === 0) {
+                return line + ',Error';
+            }
             return line + ',';
         });
 
@@ -518,6 +524,7 @@ const errorFile = file.create({
     folder: ERROR_FOLDER_ID
 });
         const savedFileId = errorFile.save();
+        file.delete({ id: fileId });
 
         movedTo = 'Error (file ' + savedFileId + ')';
 
