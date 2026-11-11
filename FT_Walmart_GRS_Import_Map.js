@@ -220,7 +220,7 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
         result = { action: 'confirm', recordId: row.internalid };
       } else {
         result = upsertGrsRecord(row.data);
-       // logUpsert(where, result);
+        logUpsert(where, result);
       }
 
       context.write({
@@ -228,7 +228,7 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
         value: { type: 'result', status: 'success', action: result.action, lineNo: row.lineNo, recordId: result.recordId }
       });
     } catch (e) {
-     // log.error((DRY_RUN ? 'DRY RUN - ' : '') + 'map error', where + ': ' + e.message);
+      log.error((DRY_RUN ? 'DRY RUN - ' : '') + 'map error', where + ': ' + e.message);
       context.write({
         key: row.fileId,
         value: { type: 'result', status: 'error', lineNo: row.lineNo, message: e.message, raw: row.raw }
