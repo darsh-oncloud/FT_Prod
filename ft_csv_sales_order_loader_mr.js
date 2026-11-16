@@ -1689,6 +1689,14 @@ if (plan.includeSynapse) {
                 }
             }
 
+createdSoIds.forEach(function (soId) {
+    record.submitFields({
+        type: record.Type.SALES_ORDER,
+        id: soId,
+        values: { custbody_child_record_processed: true }
+    });
+});
+          
         } catch (err) {
             log.error(`Failed to process SID ${sid}`, err || err.toString());
         }
