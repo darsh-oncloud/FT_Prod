@@ -405,11 +405,11 @@ define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
                         } else {
                             obj[field] = date;
 
-                            if (date) {
-                                warnings.push(
-                                    type + ' Missing Timestamp: ' + field
-                                );
-                            }
+                            // if (date) {
+                            //     warnings.push(
+                            //         type + ' Missing Timestamp: ' + field
+                            //     );
+                            // }
                         }
 
                     } else {
