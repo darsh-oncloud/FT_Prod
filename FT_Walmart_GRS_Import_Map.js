@@ -20,21 +20,15 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
   const LOCATION_MASTER_TYPE = 'customrecord_ft_location_master';
   const RETAILER_POOL_WALMART = '1';
 
-  // Walmart Pool (CSV column 1) -> NetSuite Location internal id
-  const POOL_LOCATION_MAP = {
-    CA: '32',
-    CA2: '32',
-    GA: '48',
-    GA2: '48',
-    IL: '2',
-    NJ: '1',
-    TX: '51',
-    T2: '51'
-  };
-
-  function getPoolLocation(pool) {
-    return POOL_LOCATION_MAP[String(pool || '').trim().toUpperCase()] || '';
-  }
+  // ---- Lookup config (taken from Script 2) ----
+  const POOL_MAPPING_TYPE = 'customrecord_ft_walmart_grs_mapping';
+  const POOL_MAPPING_POOL_FIELD = 'custrecord_ft_wmgrsmap_pool';
+  const SAIL_RECORD_TYPE = 'customrecord_ft_walmart_saildates_dcloc';
+  const SAIL_POOL_DC_LIST_FIELD = 'custrecord_pool_and_dc_combos';      // multiselect, display text = POOL_DC
+  const SAIL_POOL_FIELD = 'custrecord_ft_walmart_pool';                 // -> Pool Mapping record
+  const SAIL_FUSION_WAREHOUSE_FIELD = 'custrecord_ft_wmsail_fusion_warehouse'; // -> GRS location
+  const SAIL_SEARCH_CHUNK_SIZE = 25;
+  const sailByComboCache = {};                                          // "POOL_DC" -> sail object or null
 
   const EMAIL_AUTHOR = 902578;     // TODO: employee internal id
   const EMAIL_RECIPIENTS = [902578]; // TODO: recipients
@@ -60,41 +54,64 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
     if (DRY_RUN) log.audit('*** DRY RUN MODE ***', 'No records will be created/updated and no files will be moved.');
 
     try {
-      // Walmart Pool mapping
-      const mappingCache = {};
-      search.create({
-        type: 'customrecord_ft_walmart_grs_mapping',
+      // Walmart Pool mapping (Script 2 technique)
+      // Indexed by internal id (to resolve the Sail record's Pool) and by the
+      // Pool field (fallback when no Sail record matches).
+      // Sorted by internal id, so if two active mappings share a Pool the LOWEST
+      // internal id always wins (deterministic) and a warning is logged.
+      const mappingById = {};
+      const mappingByPool = {};
+      const duplicatePools = {};
+      eachResult(search.create({
+        type: POOL_MAPPING_TYPE,
         filters: [['isinactive', 'is', 'F']],
         columns: [
-          'custrecord_ft_wmgrsmap_externalid',
+          POOL_MAPPING_POOL_FIELD,
           'custrecord_ft_wmgrsmap_location',
           'custrecord_ft_wmgrsmap_weeks',
-          'internalid'
+          search.createColumn({ name: 'internalid', sort: search.Sort.ASC })
         ]
-      }).run().each(result => {
-        mappingCache[result.getValue('custrecord_ft_wmgrsmap_externalid')] = {
+      }), result => {
+        const m = {
           location: result.getValue('custrecord_ft_wmgrsmap_location'),
           weeks: result.getValue('custrecord_ft_wmgrsmap_weeks'),
           weeksText: result.getText('custrecord_ft_wmgrsmap_weeks') || result.getValue('custrecord_ft_wmgrsmap_weeks'),
           internalid: result.getValue('internalid')
         };
-        return true;
+        mappingById[m.internalid] = m;
+        const poolKey = String(result.getValue(POOL_MAPPING_POOL_FIELD) || '').trim();
+        if (!poolKey) return;
+        if (!mappingByPool[poolKey]) {
+          mappingByPool[poolKey] = m;
+        } else {
+          (duplicatePools[poolKey] = duplicatePools[poolKey] || [mappingByPool[poolKey].internalid]).push(m.internalid);
+        }
+      });
+      Object.keys(duplicatePools).forEach(p => {
+        log.audit('Pool mapping - duplicate Pool ' + p,
+          'Active mapping records ' + duplicatePools[p].join(', ') +
+          ' share this Pool. Using ' + duplicatePools[p][0] + ' when no Sail record matches.');
       });
 
-      // Walmart DC lookup (Location Master)
+      // Walmart DC lookup (Location Master) - Script 2 technique: match on DC number
+      // only (no retailer pool filter). Leading zeros still normalized ("06094" = "6094").
+      // If the same DC exists on more than one record, the Walmart retailer-pool record wins.
       const dcCache = {};
-      search.create({
+      eachResult(search.create({
         type: LOCATION_MASTER_TYPE,
         filters: [
           ['isinactive', 'is', 'F'], 'AND',
-          ['custrecord_ft_consloc_retailer_pool', 'anyof', RETAILER_POOL_WALMART], 'AND',
           ['custrecord_ft_wmdc_number', 'isnotempty', '']
         ],
-        columns: ['internalid', 'custrecord_ft_wmdc_number']
-      }).run().each(result => {
+        columns: ['internalid', 'custrecord_ft_wmdc_number', 'custrecord_ft_consloc_retailer_pool']
+      }), result => {
         const dcKey = normDC(result.getValue('custrecord_ft_wmdc_number'));
-        if (dcKey && !dcCache[dcKey]) dcCache[dcKey] = result.getValue('internalid');
-        return true;
+        if (!dcKey) return;
+        const isWalmart = String(result.getValue('custrecord_ft_consloc_retailer_pool') || '')
+          .split(',').indexOf(RETAILER_POOL_WALMART) !== -1;
+        if (!dcCache[dcKey] || (isWalmart && !dcCache[dcKey].isWalmart)) {
+          dcCache[dcKey] = { id: result.getValue('internalid'), isWalmart };
+        }
       });
 
       // Files in inbound folder
@@ -115,6 +132,9 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
           const lines = content.split(/\r?\n/);
           let isUpdate = false;
 
+          // Sail lookup (Script 2 technique): one batched search per file on POOL_DC combos
+          const sailByCombo = lookupSailRecordsForPoolDcCombos(uniquePoolDcCombos(lines));
+
           lines.forEach((line, idx) => {
             if (line.trim() === '') return;
 
@@ -132,24 +152,27 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
               return;
             }
 
-            const vendor = cols[4];
-            const pool = cols[0];
-            const dc = cols[1];
-            const keysToTry = [vendor, pool + '_' + vendor, dc + '_' + vendor, pool];
+            const pool = String(cols[0] || '').trim();
+            const dc = String(cols[1] || '').trim();
 
-            let matched = { location: '', weeks: '', internalid: '' };
-            for (let i = 0; i < keysToTry.length; i++) {
-              if (mappingCache[keysToTry[i]]) {
-                matched = mappingCache[keysToTry[i]];
-                break;
-              }
-            }
+            // 1) Sail record by exact POOL_DC
+            const sail = sailByCombo[pool + '_' + dc] || null;
+
+            // 2) Pool mapping: Sail record's Pool first, then CSV Pool field
+            const matched = (sail && sail.poolId && mappingById[sail.poolId]) ||
+              mappingByPool[pool] ||
+              { location: '', weeks: '', internalid: '' };
+
+            // 3) DC: Location Master by DC number
+            const dcHit = dcCache[normDC(dc)];
 
             base.data = {
               custrecord_ft_pool: cols[0],
               custrecord_ft_pool_id: matched.internalid || '',
               custrecord_ft_dc: cols[1],
-              custrecord_ft_dc_id: dcCache[normDC(dc)] || '',
+              custrecord_ft_dc_id: dcHit ? dcHit.id : '',
+              sail_id: sail ? sail.id : '',
+              sail_location: sail ? (sail.fusionWarehouse || '') : '',
               custrecord_ft_truck: cols[2],
               name: cols[3],
               custrecord_ft_vendor_number: cols[4],
@@ -311,10 +334,13 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
       adjMabd = getAdjustedFriday(row.custrecord_ft_mabd) || null;
     }
 
-    // Location from Pool mapping; fall back to Walmart Pool mapping record
-    const locationId = getPoolLocation(row.mapping.location) || row.mapping.location || '';
+    // Location: Fusion Warehouse from the matched Sail record (same as Script 2).
+    // No hardcoded map. No Sail match / blank Fusion Warehouse -> row error (Script 1 rule).
+    const locationId = row.sail_location || '';
     if (!locationId) {
-      throw new Error('No location mapping for Pool: ' + row.custrecord_ft_pool);
+      throw new Error(row.sail_id
+        ? 'Sail record ' + row.sail_id + ' has no Fusion Warehouse (POOL_DC: ' + row.custrecord_ft_pool + '_' + row.custrecord_ft_dc + ')'
+        : 'No Sail record found for POOL_DC: ' + row.custrecord_ft_pool + '_' + row.custrecord_ft_dc);
     }
 
     const values = {
@@ -337,6 +363,10 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
       custrecord_ft_twovsthree_week_category: row.mapping.weeks || '',
       custrecord_ft_walmart_grs_mapping: row.mapping.internalid || ''
     };
+
+    // Sail reference: only set when the lookup found one, so an update never
+    // clears a Sail reference that is already on an existing record
+    if (row.sail_id) values.custrecord_sail_record = row.sail_id;
 
     // External ID: Vendor_Name_Item_AdjMABD(yyyy-mm-dd)
     const extId = row.custrecord_ft_vendor_number + '_' +
@@ -368,13 +398,15 @@ define(['N/search', 'N/file', 'N/record', 'N/log', 'N/email', 'N/runtime'],
 
   function logUpsert(where, r) {
     const prefix = DRY_RUN ? 'DRY RUN - WOULD ' : '';
+    const ids = ' | Internal ID: ' + (r.recordId || (DRY_RUN ? '(not created - dry run)' : '')) +
+      ' | External ID: ' + r.extId;
     if (r.action === 'create') {
-      log.audit(prefix + 'CREATE', where + ' | External ID: ' + r.extId + (r.recordId ? ' | Record ' + r.recordId : ''));
+      log.audit(prefix + 'RECORD CREATED', where + ids);
     } else if (r.action === 'update') {
       const diff = r.changes.map(c => c.field + ': "' + c.from + '" -> "' + c.to + '"').join('; ');
-      log.audit(prefix + 'UPDATE', where + ' | Record ' + r.recordId + ' | ' + diff);
+      log.audit(prefix + 'RECORD UPDATED', where + ids + ' | Changed: ' + diff);
     } else {
-      log.debug((DRY_RUN ? 'DRY RUN - ' : '') + 'NO CHANGE', where + ' | Record ' + r.recordId + ' | External ID: ' + r.extId);
+      log.audit((DRY_RUN ? 'DRY RUN - ' : '') + 'RECORD NO CHANGE', where + ids);
     }
   }
 
@@ -680,6 +712,113 @@ const errorFile = file.create({
     });
 
     log.audit('Email Sent', subject);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Lookup helpers (Sail POOL_DC technique from Script 2)
+  // ---------------------------------------------------------------------------
+
+  // Runs a search over all pages (avoids the 4,000-row limit of run().each)
+  function eachResult(searchObj, fn) {
+    const paged = searchObj.runPaged({ pageSize: 1000 });
+    paged.pageRanges.forEach(range => {
+      paged.fetch({ index: range.index }).data.forEach(fn);
+    });
+  }
+
+  // Distinct "POOL_DC" combos from the raw CSV lines of one file
+  function uniquePoolDcCombos(lines) {
+    const seen = {};
+    const out = [];
+    lines.forEach(line => {
+      if (line.trim() === '') return;
+      const cols = splitCSV(line);
+      if (String(cols[0]).toUpperCase() === 'POOL') return;
+      const pool = String(cols[0] || '').trim();
+      const dc = String(cols[1] || '').trim();
+      if (!pool || !dc) return;
+      const combo = pool + '_' + dc;
+      if (!seen[combo]) { seen[combo] = true; out.push(combo); }
+    });
+    return out;
+  }
+
+  // "9854_6011,11026_6011" -> ['9854_6011', '11026_6011'] (exact tokens)
+  function parsePoolDcTokens(rawValue) {
+    const tokens = [];
+    String(rawValue || '')
+      .split(/[,;\s]+/)
+      .map(t => t.trim())
+      .filter(Boolean)
+      .forEach(token => {
+        const parts = token.split('_').filter(Boolean);
+        if (parts.length === 2) {
+          tokens.push(parts[0] + '_' + parts[1]);
+        } else if (parts.length > 2 && parts.length % 2 === 0) {
+          for (let i = 0; i < parts.length; i += 2) tokens.push(parts[i] + '_' + parts[i + 1]);
+        }
+      });
+    return tokens;
+  }
+
+  function chunkArray(arr, size) {
+    const out = [];
+    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+    return out;
+  }
+
+  // Resolves POOL_DC combos to Sail records. "contains" is only a pre-filter;
+  // results are then checked token by token so 9854_6011 never matches 19854_6011.
+  function lookupSailRecordsForPoolDcCombos(combos) {
+    const uncached = combos.filter(c => !Object.prototype.hasOwnProperty.call(sailByComboCache, c));
+
+    if (uncached.length) {
+      const uncachedSet = {};
+      uncached.forEach(c => { uncachedSet[c] = true; });
+
+      chunkArray(uncached, SAIL_SEARCH_CHUNK_SIZE).forEach(chunk => {
+        const comboFilter = [];
+        chunk.forEach((combo, i) => {
+          if (i > 0) comboFilter.push('OR');
+          comboFilter.push(['formulatext: {' + SAIL_POOL_DC_LIST_FIELD + '}', 'contains', combo]);
+        });
+
+        search.create({
+          type: SAIL_RECORD_TYPE,
+          filters: [comboFilter, 'AND', ['isinactive', 'is', 'F']],
+          columns: ['internalid', 'name', SAIL_POOL_DC_LIST_FIELD, SAIL_POOL_FIELD, SAIL_FUSION_WAREHOUSE_FIELD]
+        }).run().each(result => {
+          const sail = {
+            id: result.id,
+            name: String(result.getValue('name') || '').trim(),
+            poolId: result.getValue(SAIL_POOL_FIELD) || '',
+            fusionWarehouse: result.getValue(SAIL_FUSION_WAREHOUSE_FIELD) || ''
+          };
+          parsePoolDcTokens(result.getText(SAIL_POOL_DC_LIST_FIELD)).forEach(token => {
+            if (!uncachedSet[token]) return;
+            const existing = sailByComboCache[token];
+            if (existing && existing.id !== sail.id) {
+              log.audit('Sail lookup - POOL_DC ' + token + ' on multiple Sail records',
+                'keeping ' + existing.id + ' (' + existing.name + '), ignoring ' + sail.id + ' (' + sail.name + ')');
+              return;
+            }
+            sailByComboCache[token] = sail;
+          });
+          return true;
+        });
+      });
+
+      uncached.forEach(c => {
+        if (!Object.prototype.hasOwnProperty.call(sailByComboCache, c)) {
+          sailByComboCache[c] = null;
+          log.audit('Sail lookup - no Sail record', 'POOL_DC ' + c + ' - Pool falls back to CSV Pool lookup');
+        }
+      });
+    }
+
+    const result = {};
+    combos.forEach(c => { result[c] = sailByComboCache[c]; });
+    return result;
   }
 
   // ---------------------------------------------------------------------------
