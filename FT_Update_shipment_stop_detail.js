@@ -1,167 +1,268 @@
 /**
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
+ *
+ * Purpose:
+ * Find Purchase Order Stop Payload History files
+ * where ANY historical payload is missing:
+ * custrecord_ft_ship_refid
+ *
+ * READ ONLY - No record/file updates.
  */
-define(['N/file', 'N/search', 'N/log'],
-    (file, search, log) => {
+define(['N/search', 'N/file', 'N/log'], function(search, file, log) {
 
-    const FILE_ID = 21490546;
-    const FOLDER_ID = 2777973;
+    var FOLDER_ID = 2788915;
+    var REQUIRED_FIELD = 'custrecord_ft_ship_refid';
 
-    // 0 = Process all Shipment Reference IDs
-    // 2 = Process first 2 IDs for testing
-    const TEST_LIMIT = 0;
+    function getInputData() {
 
-    const getInputData = () => {
-
-        const csv = file.load({
-            id: FILE_ID
-        }).getContents();
-
-        const refs = [...new Set(
-            csv.replace(/^\uFEFF/, '')
-                .split(/\r?\n/)
-                .map(v => v.trim().replace(/^"|"$/g, ''))
-                .filter(v =>
-                    v &&
-                    v !== 'custrecord_ft_ship_refid'
-                )
-        )];
-
-        const input = TEST_LIMIT > 0
-            ? refs.slice(0, TEST_LIMIT)
-            : refs;
-
-        log.audit('Shipment References Loaded', {
-            fileId: FILE_ID,
-            totalReferences: refs.length,
-            processing: input.length
-        });
-
-        return input;
-    };
-
-    const map = context => {
-
-        const refId = String(context.value).trim();
-
-        const soSearch = search.create({
-            type: search.Type.SALES_ORDER,
+        return search.create({
+            type: 'file',
             filters: [
-                ['mainline', 'is', 'T'],
+                ['folder', 'anyof', FOLDER_ID],
                 'AND',
-                ['custbody_ft_related_stop_details',
-                    'contains', refId]
+                ['name', 'startswith', 'purchaseorder_']
             ],
             columns: [
-                search.createColumn({
-                    name: 'internalid'
-                })
+                'internalid',
+                'name'
             ]
         });
+    }
 
-        // Retrieve matching Sales Order Internal IDs.
-        soSearch.run().each(result => {
+    function map(context) {
 
-            const soId = result.getValue({
-                name: 'internalid'
+        var fileId = '';
+        var fileName = '';
+
+        try {
+
+            var result = JSON.parse(context.value);
+
+            fileId = result.id;
+            fileName = result.values.name;
+
+            if (typeof fileName === 'object') {
+                fileName = fileName.value || fileName.text || '';
+            }
+
+            if (String(fileName).toLowerCase().indexOf('purchaseorder_') !== 0) {
+                return;
+            }
+
+            var historyFile = file.load({
+                id: fileId
             });
 
-            if (soId) {
-                context.write({
-                    key: String(soId),
-                    value: refId
+            var content = historyFile.getContents();
+
+            var payloads = extractPayloads(content);
+
+            var missingPayloads = [];
+
+            for (var i = 0; i < payloads.length; i++) {
+
+                var payload = payloads[i];
+
+                if (payload.indexOf(REQUIRED_FIELD) === -1) {
+                    missingPayloads.push(i + 1);
+                }
+            }
+
+            var status = 'PASS';
+
+            if (payloads.length === 0) {
+                status = 'NO_PAYLOAD_FOUND';
+
+            } else if (missingPayloads.length > 0) {
+                status = 'MISSING_REF_ID';
+
+                log.audit({
+                    title: 'PO FILE - MISSING SHIPMENT REF ID',
+                    details: JSON.stringify({
+                        fileId: fileId,
+                        fileName: fileName,
+                        totalPayloads: payloads.length,
+                        missingCount: missingPayloads.length,
+                        missingPayloadNumbers: missingPayloads
+                    })
                 });
             }
 
+            context.write({
+                key: status,
+                value: JSON.stringify({
+                    fileId: fileId,
+                    fileName: fileName,
+                    totalPayloads: payloads.length,
+                    missingPayloads: missingPayloads
+                })
+            });
+
+        } catch (e) {
+
+            log.error({
+                title: 'FILE PROCESSING ERROR - ' + fileId,
+                details: e.message
+            });
+
+            context.write({
+                key: 'ERROR',
+                value: JSON.stringify({
+                    fileId: fileId,
+                    fileName: fileName,
+                    error: e.message
+                })
+            });
+        }
+    }
+
+    /**
+     * Extract separate top-level JSON objects or arrays
+     * from a text file containing payload history.
+     *
+     * Supports nested objects, multiline JSON,
+     * quoted strings and escaped characters.
+     */
+    function extractPayloads(content) {
+
+        var payloads = [];
+        var start = -1;
+        var stack = [];
+        var inString = false;
+        var escaped = false;
+
+        for (var i = 0; i < content.length; i++) {
+
+            var ch = content.charAt(i);
+
+            if (start === -1) {
+
+                if (ch === '{' || ch === '[') {
+                    start = i;
+                    stack = [ch === '{' ? '}' : ']'];
+                    inString = false;
+                    escaped = false;
+                }
+
+                continue;
+            }
+
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+
+            if (ch === '\\' && inString) {
+                escaped = true;
+                continue;
+            }
+
+            if (ch === '"') {
+                inString = !inString;
+                continue;
+            }
+
+            if (inString) {
+                continue;
+            }
+
+            if (ch === '{') {
+                stack.push('}');
+
+            } else if (ch === '[') {
+                stack.push(']');
+
+            } else if (ch === '}' || ch === ']') {
+
+                var expected = stack.pop();
+
+                if (expected !== ch) {
+                    start = -1;
+                    stack = [];
+                    continue;
+                }
+
+                if (stack.length === 0) {
+
+                    payloads.push(
+                        content.substring(start, i + 1)
+                    );
+
+                    start = -1;
+                }
+            }
+        }
+
+        return payloads;
+    }
+
+    function reduce(context) {
+        // No reduce required.
+    }
+
+    function summarize(summary) {
+
+        var totalFiles = 0;
+        var passedFiles = 0;
+        var missingFiles = 0;
+        var noPayloadFiles = 0;
+        var errorFiles = 0;
+        var totalMissingPayloads = 0;
+
+        summary.output.iterator().each(function(key, value) {
+
+            var result = JSON.parse(value);
+
+            totalFiles++;
+
+            if (key === 'PASS') {
+                passedFiles++;
+
+            } else if (key === 'MISSING_REF_ID') {
+
+                missingFiles++;
+                totalMissingPayloads += result.missingPayloads.length;
+
+            } else if (key === 'NO_PAYLOAD_FOUND') {
+                noPayloadFiles++;
+
+            } else if (key === 'ERROR') {
+                errorFiles++;
+            }
+
             return true;
         });
-    };
 
-    const reduce = context => {
-
-        // Each unique Sales Order ID is processed once.
-        context.write({
-            key: context.key,
-            value: context.key
+        log.audit({
+            title: 'FINAL PO PAYLOAD VALIDATION SUMMARY',
+            details: JSON.stringify({
+                totalFilesChecked: totalFiles,
+                passedFiles: passedFiles,
+                filesMissingRefId: missingFiles,
+                totalPayloadsMissingRefId: totalMissingPayloads,
+                filesWithNoPayload: noPayloadFiles,
+                errorFiles: errorFiles
+            })
         });
-    };
-
-    const summarize = summary => {
-
-        let errorCount = 0;
-
-        if (summary.inputSummary.error) {
-            errorCount++;
-            log.error('Input Error', summary.inputSummary.error);
-        }
 
         summary.mapSummary.errors.iterator().each(
-            (key, error) => {
-                errorCount++;
-                log.error('Map Error - ' + key, error);
+            function(key, error) {
+
+                log.error({
+                    title: 'MAP ERROR - ' + key,
+                    details: error
+                });
+
                 return true;
             }
         );
-
-        summary.reduceSummary.errors.iterator().each(
-            (key, error) => {
-                errorCount++;
-                log.error('Reduce Error - ' + key, error);
-                return true;
-            }
-        );
-
-        // Avoid creating incomplete CSV if errors occurred.
-        if (errorCount > 0) {
-            log.error('CSV NOT CREATED', {
-                errorCount,
-                reason: 'One or more searches failed'
-            });
-            return;
-        }
-
-        const uniqueIds = [];
-
-        summary.output.iterator().each((key, value) => {
-            uniqueIds.push(String(key));
-            return true;
-        });
-
-        uniqueIds.sort((a, b) => Number(a) - Number(b));
-
-        const csvContent = [
-            'Sales Order Internal ID',
-            ...uniqueIds
-        ].join('\n');
-
-        // Save final CSV in the requested folder.
-        const outputFile = file.create({
-            name: 'Unique_Sales_Order_IDs_' +
-                new Date().toISOString()
-                    .replace(/[:.]/g, '-') + '.csv',
-            fileType: file.Type.CSV,
-            contents: csvContent,
-            folder: FOLDER_ID
-        });
-
-        const outputFileId = outputFile.save();
-
-        log.audit('FINAL CSV CREATED SUCCESSFULLY', {
-            outputFileId,
-            folderId: FOLDER_ID,
-            totalUniqueSalesOrders: uniqueIds.length,
-            fileName: outputFile.name,
-            seconds: summary.seconds,
-            usage: summary.usage,
-            yields: summary.yields
-        });
-    };
+    }
 
     return {
-        getInputData,
-        map,
-        reduce,
-        summarize
+        getInputData: getInputData,
+        map: map,
+        reduce: reduce,
+        summarize: summarize
     };
 });
