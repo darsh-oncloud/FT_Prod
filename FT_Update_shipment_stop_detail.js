@@ -1,268 +1,568 @@
 /**
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
- *
- * Purpose:
- * Find Purchase Order Stop Payload History files
- * where ANY historical payload is missing:
- * custrecord_ft_ship_refid
- *
- * READ ONLY - No record/file updates.
  */
-define(['N/search', 'N/file', 'N/log'], function(search, file, log) {
+define(['N/search', 'N/record', 'N/log'], (search, record, log) => {
 
-    var FOLDER_ID = 2788915;
-    var REQUIRED_FIELD = 'custrecord_ft_ship_refid';
+    const PO_SEARCH = 'customsearch_ds_pos_without_stop';
+    const STOP_SEARCH = 'customsearch_ft_finding_old_stops';
 
-    function getInputData() {
+    const TARGET = 'custbody_ft_related_stop_details';
+    const UPDATE_CHECKBOX = 'custbody_ft_update_stops';
 
-        return search.create({
-            type: 'file',
-            filters: [
-                ['folder', 'anyof', FOLDER_ID],
-                'AND',
-                ['name', 'startswith', 'purchaseorder_']
-            ],
-            columns: [
-                'internalid',
-                'name'
-            ]
+    // 2 = Test first 2 POs and update them.
+    // 0 = Process ALL POs from saved search.
+    const PO_LIMIT = 2;
+
+    const FIELDS = [
+        'name',
+        'custrecord_ft_ship_type',
+        'custrecord_ft_ship_seq',
+        'custrecord_ft_ship_loccode',
+        'custrecord_ft_ship_locname',
+        'custrecord_ft_ship_add1',
+        'custrecord_ft_ship_add2',
+        'custrecord_ft_ship_city',
+        'custrecord_ft_ship_state',
+        'custrecord_ft_ship_zip',
+        'custrecord_ft_ship_country',
+        'custrecord_ft_ship_plandate',
+        'custrecord_ft_ship_actualdate',
+        'custrecord_ft_ship_appt',
+        'custrecord_ft_ship_latdeg',
+        'custrecord_ft_ship_longdeg',
+        'custrecord_ft_ship_latdirect',
+        'custrecord_ft_longdirection',
+        'custrecord_ft_ship_refid',
+        'custrecord_ft_shipstop_pallcount',
+        'custrecord_ft_stop_weight',
+        'custrecord_ft_stop_linearfeet',
+        'custrecord_ft_stop_casescount',
+        'custrecord_ft_shipstop_apptime',
+        'custrecord_ft_stop_plantime',
+        'custrecord_ft_stop_actualtime',
+        'custrecord_ft_shipstop_latereason',
+        'custrecord_ft_shipstop_apptnum'
+    ];
+
+    const NUMBER_FIELDS = [
+        'custrecord_ft_shipstop_pallcount',
+        'custrecord_ft_stop_weight',
+        'custrecord_ft_stop_linearfeet',
+        'custrecord_ft_stop_casescount'
+    ];
+
+    const DATE_FIELDS = [
+        'custrecord_ft_ship_plandate',
+        'custrecord_ft_ship_actualdate',
+        'custrecord_ft_ship_appt'
+    ];
+
+    const TIME_FIELDS = [
+        'custrecord_ft_shipstop_apptime',
+        'custrecord_ft_stop_plantime',
+        'custrecord_ft_stop_actualtime'
+    ];
+
+    const formatDate = value => {
+        const text = String(value || '').trim();
+        const m = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+
+        return m
+            ? m[1].padStart(2, '0') + '/' +
+              m[2].padStart(2, '0') + '/' + m[3]
+            : text;
+    };
+
+    const formatTime = value => {
+        const text = String(value || '').trim();
+        if (!text) return '';
+
+        const m = text.match(
+            /^(\d{1,2}):(\d{2})(?::\d{2})?\s*(am|pm)?$/i
+        );
+
+        if (!m) return text;
+
+        let hour = Number(m[1]);
+        const period = (m[3] || '').toLowerCase();
+
+        if (period === 'pm' && hour < 12) hour += 12;
+        if (period === 'am' && hour === 12) hour = 0;
+
+        return hour + ':' + m[2];
+    };
+
+    const getInputData = () => {
+        const s = search.load({ id: PO_SEARCH });
+
+        if (!s.columns.some(c =>
+            c.name === 'internalid' &&
+            !c.join &&
+            c.summary === search.Summary.GROUP
+        )) {
+            s.columns = [
+                ...s.columns,
+                search.createColumn({
+                    name: 'internalid',
+                    summary: search.Summary.GROUP
+                })
+            ];
+        }
+
+        // Production: Return search directly.
+        // NetSuite handles paging and Map/Reduce input.
+        if (PO_LIMIT === 0) {
+            log.audit('START - ALL POs', {
+                searchId: PO_SEARCH,
+                mode: 'PRODUCTION'
+            });
+            return s;
+        }
+
+        // Test: Only first 2 PO results.
+        const results = s.run().getRange({
+            start: 0,
+            end: PO_LIMIT
         });
-    }
 
-    function map(context) {
+        const input = results.map(r => ({
+            poId: r.getValue({
+                name: 'internalid',
+                summary: search.Summary.GROUP
+            }),
+            docNum: r.getValue({
+                name: 'tranid',
+                summary: search.Summary.GROUP
+            })
+        }));
 
-        var fileId = '';
-        var fileName = '';
+        log.audit('TEST - POs Selected', {
+            requested: PO_LIMIT,
+            count: input.length,
+            input
+        });
+
+        return input;
+    };
+
+    const map = context => {
+        let poId, docNum;
+
+        const report = (status, details) => {
+            context.write({
+                key: status,
+                value: JSON.stringify(details)
+            });
+        };
 
         try {
+            const data = JSON.parse(context.value);
 
-            var result = JSON.parse(context.value);
+            if (PO_LIMIT > 0) {
+                poId = data.poId;
+                docNum = data.docNum;
+            } else {
+                const values = data.values || {};
 
-            fileId = result.id;
-            fileName = result.values.name;
+                poId = values['GROUP(internalid)'];
+                docNum = values['GROUP(tranid)'];
 
-            if (typeof fileName === 'object') {
-                fileName = fileName.value || fileName.text || '';
+                if (poId && typeof poId === 'object') {
+                    poId = poId.value;
+                }
+
+                if (docNum && typeof docNum === 'object') {
+                    docNum = docNum.value;
+                }
             }
 
-            if (String(fileName).toLowerCase().indexOf('purchaseorder_') !== 0) {
+            if (!poId || !docNum) {
+                log.error('SKIPPED - Missing PO Details', data);
+                report('SKIPPED', { poId, docNum });
                 return;
             }
 
-            var historyFile = file.load({
-                id: fileId
+            // SEARCH 2 - Historical Shipment Stops.
+            const oldSearch = search.load({
+                id: STOP_SEARCH
             });
 
-            var content = historyFile.getContents();
+            oldSearch.filterExpression = [
+                ['systemnotes.context', 'anyof', 'MPR'],
+                'AND',
+                ['systemnotes.newvalue', 'startswith', String(docNum)]
+            ];
 
-            var payloads = extractPayloads(content);
+            const oldResults = oldSearch.run().getRange({
+                start: 0,
+                end: 3
+            });
 
-            var missingPayloads = [];
+            const stopIds = oldResults.map(r =>
+                r.getValue({
+                    name: 'internalid',
+                    summary: search.Summary.MAX
+                })
+            );
 
-            for (var i = 0; i < payloads.length; i++) {
+            // Require exactly 2 unique Shipment Stops.
+            if (
+                oldResults.length !== 2 ||
+                stopIds.some(id => !id) ||
+                new Set(stopIds.map(String)).size !== 2
+            ) {
+                log.audit('SKIPPED - Invalid Stop Count', {
+                    poId, docNum, stopIds,
+                    count: oldResults.length
+                });
 
-                var payload = payloads[i];
+                report('SKIPPED', {
+                    poId, docNum,
+                    reason: 'Invalid Stop Count'
+                });
+                return;
+            }
 
-                if (payload.indexOf(REQUIRED_FIELD) === -1) {
-                    missingPayloads.push(i + 1);
+            // SEARCH 3 - Actual Shipment Stop data.
+            const columns = FIELDS.map(id =>
+                search.createColumn({ name: id })
+            );
+
+            const stopResults = search.create({
+                type: 'customrecord_ft_ship_stop',
+                filters: [
+                    ['internalid', 'anyof', stopIds]
+                ],
+                columns
+            }).run().getRange({
+                start: 0,
+                end: 3
+            });
+
+            if (stopResults.length !== 2) {
+                log.audit('SKIPPED - Missing Stops', {
+                    poId, docNum, stopIds
+                });
+
+                report('SKIPPED', {
+                    poId, docNum,
+                    reason: 'Missing Stop Records'
+                });
+                return;
+            }
+
+            const stops = stopResults.map(r => {
+                const obj = {};
+
+                FIELDS.forEach((field, i) => {
+                    obj[field] = r.getValue(columns[i]);
+                });
+
+                return obj;
+            });
+
+            const types = stops.map(s =>
+                String(s.custrecord_ft_ship_type || '')
+            );
+
+            const refs = stops.map(s =>
+                String(s.custrecord_ft_ship_refid || '').trim()
+            );
+
+            // Exactly 1 Pickup and 1 Drop Off,
+            // both with valid Shipment Reference IDs.
+            if (
+                !types.includes('1') ||
+                !types.includes('2') ||
+                refs.some(ref =>
+                    !ref || !ref.startsWith(String(docNum) + '_')
+                )
+            ) {
+                log.audit('SKIPPED - Invalid Stop Data', {
+                    poId, docNum, stopIds, types, refs
+                });
+
+                report('SKIPPED', {
+                    poId, docNum,
+                    reason: 'Invalid Pickup/Drop Off or Ref ID'
+                });
+                return;
+            }
+
+            // Load existing PO field values.
+            const po = record.load({
+                type: record.Type.PURCHASE_ORDER,
+                id: poId,
+                isDynamic: false
+            });
+
+            const oldValue = po.getValue({
+                fieldId: TARGET
+            }) || '';
+
+            const oldCheckbox = po.getValue({
+                fieldId: UPDATE_CHECKBOX
+            });
+
+            let existing = [];
+
+            if (oldValue) {
+                try {
+                    existing = JSON.parse(oldValue);
+
+                    if (!Array.isArray(existing)) {
+                        throw new Error('Existing JSON is not an array');
+                    }
+
+                } catch (e) {
+                    log.error('SKIPPED - Invalid Existing JSON', {
+                        poId, docNum,
+                        error: e.message
+                    });
+
+                    report('SKIPPED', {
+                        poId, docNum,
+                        reason: 'Invalid Existing JSON'
+                    });
+                    return;
                 }
             }
 
-            var status = 'PASS';
+            const warnings = [];
 
-            if (payloads.length === 0) {
-                status = 'NO_PAYLOAD_FOUND';
+            // Build corrected JSON.
+            const payload = stops.map(stop => {
+                const type = String(stop.custrecord_ft_ship_type);
 
-            } else if (missingPayloads.length > 0) {
-                status = 'MISSING_REF_ID';
+                const previous = existing.find(p =>
+                    p &&
+                    String(p.custrecord_ft_ship_type) === type
+                ) || {};
 
-                log.audit({
-                    title: 'PO FILE - MISSING SHIPMENT REF ID',
-                    details: JSON.stringify({
-                        fileId: fileId,
-                        fileName: fileName,
-                        totalPayloads: payloads.length,
-                        missingCount: missingPayloads.length,
-                        missingPayloadNumbers: missingPayloads
-                    })
+                const obj = {};
+
+                FIELDS.forEach(field => {
+                    let value = stop[field];
+
+                    // Preserve original PO Location Code
+                    // when missing on the Shipment Stop.
+                    if (
+                        field === 'custrecord_ft_ship_loccode' &&
+                        (value === null ||
+                         value === undefined ||
+                         value === '')
+                    ) {
+                        value = previous[field] || '';
+                    }
+
+                    // Include all specified fields,
+                    // even when empty.
+                    if (
+                        value === null ||
+                        value === undefined ||
+                        value === ''
+                    ) {
+                        obj[field] = '';
+                        return;
+                    }
+
+                    if (NUMBER_FIELDS.includes(field)) {
+                        const num = Number(value);
+
+                        if (Number.isFinite(num)) {
+                            obj[field] = num;
+                        } else {
+                            obj[field] = '';
+                            warnings.push(
+                                type + ' Invalid Number: ' + field
+                            );
+                        }
+
+                    } else if (TIME_FIELDS.includes(field)) {
+                        obj[field] = formatTime(value);
+
+                    } else if (DATE_FIELDS.includes(field)) {
+                        const date = formatDate(value);
+                        const previousValue = String(
+                            previous[field] || ''
+                        ).trim();
+
+                        const previousDate = formatDate(previousValue);
+
+                        const dateTimeMatch = previousValue.match(
+                            /^\d{1,2}\/\d{1,2}\/\d{4}\s+(\d{1,2}:\d{2})$/
+                        );
+
+                        // Preserve verified original timestamp.
+                        if (
+                            date &&
+                            date === previousDate &&
+                            dateTimeMatch
+                        ) {
+                            obj[field] =
+                                date + ' ' + dateTimeMatch[1];
+                        } else {
+                            obj[field] = date;
+
+                            if (date) {
+                                warnings.push(
+                                    type + ' Missing Timestamp: ' + field
+                                );
+                            }
+                        }
+
+                    } else {
+                        obj[field] = String(value);
+                    }
+
+                    // Get Stop ID from reference suffix.
+                    if (field === 'custrecord_ft_ship_refid') {
+                        const match = String(value).match(/_(\d+)$/);
+
+                        obj.custrecord_ft_stopID =
+                            match ? match[1] : '';
+
+                        if (!match) {
+                            warnings.push(
+                                type + ' Invalid Stop Reference ID'
+                            );
+                        }
+                    }
                 });
+
+                return obj;
+            });
+
+            // Pickup first, Drop Off second.
+            payload.sort((a, b) =>
+                Number(b.custrecord_ft_ship_type) -
+                Number(a.custrecord_ft_ship_type)
+            );
+
+            const newValue = JSON.stringify(payload);
+
+            // Skip if payload has missing required timestamps.
+            if (warnings.length) {
+                log.audit('SKIPPED - Payload Warnings', {
+                    poId,
+                    docNum,
+                    stopIds,
+                    warnings
+                });
+
+                report('SKIPPED', {
+                    poId, docNum,
+                    reason: warnings.join('; ')
+                });
+                return;
             }
 
-            context.write({
-                key: status,
-                value: JSON.stringify({
-                    fileId: fileId,
-                    fileName: fileName,
-                    totalPayloads: payloads.length,
-                    missingPayloads: missingPayloads
-                })
+            // Skip if corrected JSON and checkbox already match.
+            if (oldValue === newValue && oldCheckbox === true) {
+                log.audit('ALREADY UPDATED', {
+                    poId, docNum
+                });
+
+                report('UNCHANGED', { poId, docNum });
+                return;
+            }
+
+            // UPDATE JSON + CHECKBOX IN ONE CALL.
+            record.submitFields({
+                type: record.Type.PURCHASE_ORDER,
+                id: poId,
+                values: {
+                    [TARGET]: newValue,
+                    [UPDATE_CHECKBOX]: true
+                },
+                options: {
+                    enableSourcing: false,
+                    ignoreMandatoryFields: true
+                }
+            });
+
+            log.audit('PO UPDATED SUCCESSFULLY', {
+                poId,
+                docNum,
+                stopIds,
+                pickupRef: payload[0].custrecord_ft_ship_refid,
+                dropoffRef: payload[1].custrecord_ft_ship_refid,
+                oldCheckbox,
+                newCheckbox: true,
+                oldValue,
+                newValue
+            });
+
+            report('UPDATED', {
+                poId,
+                docNum,
+                stopIds
             });
 
         } catch (e) {
-
-            log.error({
-                title: 'FILE PROCESSING ERROR - ' + fileId,
-                details: e.message
+            log.error('PO Processing Error', {
+                poId,
+                docNum,
+                name: e.name,
+                message: e.message,
+                stack: e.stack
             });
 
-            context.write({
-                key: 'ERROR',
-                value: JSON.stringify({
-                    fileId: fileId,
-                    fileName: fileName,
-                    error: e.message
-                })
+            report('FAILED', {
+                poId,
+                docNum,
+                error: e.message
             });
         }
-    }
+    };
 
-    /**
-     * Extract separate top-level JSON objects or arrays
-     * from a text file containing payload history.
-     *
-     * Supports nested objects, multiline JSON,
-     * quoted strings and escaped characters.
-     */
-    function extractPayloads(content) {
+    // Summarize successful, skipped and failed POs.
+    const summarize = summary => {
+        const counts = {
+            UPDATED: 0,
+            SKIPPED: 0,
+            UNCHANGED: 0,
+            FAILED: 0
+        };
 
-        var payloads = [];
-        var start = -1;
-        var stack = [];
-        var inString = false;
-        var escaped = false;
+        const details = [];
 
-        for (var i = 0; i < content.length; i++) {
+        summary.output.iterator().each((key, value) => {
+            counts[key] = (counts[key] || 0) + 1;
 
-            var ch = content.charAt(i);
-
-            if (start === -1) {
-
-                if (ch === '{' || ch === '[') {
-                    start = i;
-                    stack = [ch === '{' ? '}' : ']'];
-                    inString = false;
-                    escaped = false;
-                }
-
-                continue;
+            if (key !== 'UPDATED') {
+                details.push({
+                    status: key,
+                    data: JSON.parse(value)
+                });
             }
-
-            if (escaped) {
-                escaped = false;
-                continue;
-            }
-
-            if (ch === '\\' && inString) {
-                escaped = true;
-                continue;
-            }
-
-            if (ch === '"') {
-                inString = !inString;
-                continue;
-            }
-
-            if (inString) {
-                continue;
-            }
-
-            if (ch === '{') {
-                stack.push('}');
-
-            } else if (ch === '[') {
-                stack.push(']');
-
-            } else if (ch === '}' || ch === ']') {
-
-                var expected = stack.pop();
-
-                if (expected !== ch) {
-                    start = -1;
-                    stack = [];
-                    continue;
-                }
-
-                if (stack.length === 0) {
-
-                    payloads.push(
-                        content.substring(start, i + 1)
-                    );
-
-                    start = -1;
-                }
-            }
-        }
-
-        return payloads;
-    }
-
-    function reduce(context) {
-        // No reduce required.
-    }
-
-    function summarize(summary) {
-
-        var totalFiles = 0;
-        var passedFiles = 0;
-        var missingFiles = 0;
-        var noPayloadFiles = 0;
-        var errorFiles = 0;
-        var totalMissingPayloads = 0;
-
-        summary.output.iterator().each(function(key, value) {
-
-            var result = JSON.parse(value);
-
-            totalFiles++;
-
-            if (key === 'PASS') {
-                passedFiles++;
-
-            } else if (key === 'MISSING_REF_ID') {
-
-                missingFiles++;
-                totalMissingPayloads += result.missingPayloads.length;
-
-            } else if (key === 'NO_PAYLOAD_FOUND') {
-                noPayloadFiles++;
-
-            } else if (key === 'ERROR') {
-                errorFiles++;
-            }
-
             return true;
         });
 
-        log.audit({
-            title: 'FINAL PO PAYLOAD VALIDATION SUMMARY',
-            details: JSON.stringify({
-                totalFilesChecked: totalFiles,
-                passedFiles: passedFiles,
-                filesMissingRefId: missingFiles,
-                totalPayloadsMissingRefId: totalMissingPayloads,
-                filesWithNoPayload: noPayloadFiles,
-                errorFiles: errorFiles
-            })
+        summary.mapSummary.errors.iterator().each((key, error) => {
+            log.error('Uncaught Map Error - ' + key, error);
+            return true;
         });
 
-        summary.mapSummary.errors.iterator().each(
-            function(key, error) {
+        log.audit('FINAL MR SUMMARY', {
+            mode: PO_LIMIT === 0 ? 'ALL POs' : 'TEST ' + PO_LIMIT,
+            counts,
+            usage: summary.usage,
+            yields: summary.yields,
+            seconds: summary.seconds,
+            inputError: summary.inputSummary.error || ''
+        });
 
-                log.error({
-                    title: 'MAP ERROR - ' + key,
-                    details: error
-                });
-
-                return true;
-            }
-        );
-    }
+        // Log skipped / failed records individually.
+        details.forEach(item => {
+            log.audit('PO Result - ' + item.status, item.data);
+        });
+    };
 
     return {
-        getInputData: getInputData,
-        map: map,
-        reduce: reduce,
-        summarize: summarize
+        getInputData,
+        map,
+        summarize
     };
 });
